@@ -1,12 +1,15 @@
-# RAG · Qdrant + Voyage + Claude
+# RAG · LangChain + Qdrant + Voyage + Claude
 
 End-to-end local RAG: ingest PDFs → Qdrant → query via FastAPI → answer with Claude.
+The whole RAG plumbing (loader, splitter, embed, store, chain) is **LangChain** + LCEL;
+we own the FastAPI surface, the Streamlit UI, and the Dagster orchestration.
 
 ## Stack
 
-- **Vector DB**: Qdrant (Docker)
-- **Embeddings**: Voyage AI (`voyage-3`, 1024-dim)
-- **Generation**: Anthropic Claude (Sonnet 4.6)
+- **Framework**: LangChain (PyPDFLoader + RecursiveCharacterTextSplitter + QdrantVectorStore + LCEL chain)
+- **Vector DB**: Qdrant (Docker), via `langchain-qdrant`
+- **Embeddings**: Voyage AI (`voyage-3`, 1024-dim) via `langchain-voyageai`
+- **Generation**: Anthropic Claude (Sonnet 4.6) via `langchain-anthropic`
 - **API**: FastAPI
 - **UI**: Streamlit
 - **Orchestration** (optional): Dagster, ingesting PDFs from Azure Blob Storage
@@ -22,14 +25,14 @@ rag-qdrant/
 ├── src/
 │   ├── config.py                  # pydantic-settings
 │   ├── ingest/
-│   │   ├── loaders.py             # PDF -> page records
-│   │   ├── chunker.py             # recursive char splitter
-│   │   └── pipeline.py            # load -> chunk -> embed -> upsert
+│   │   ├── loaders.py             # PyPDFLoader -> langchain Documents (one per page)
+│   │   ├── chunker.py             # RecursiveCharacterTextSplitter.split_documents
+│   │   └── pipeline.py            # load -> chunk -> QdrantVectorStore.add_documents
 │   ├── retrieval/
-│   │   ├── embeddings.py          # Voyage wrapper
-│   │   └── store.py               # Qdrant wrapper
+│   │   ├── embeddings.py          # VoyageAIEmbeddings factory
+│   │   └── store.py               # QdrantVectorStore + collection admin (count/reset/list_sources)
 │   ├── generation/
-│   │   └── llm.py                 # Claude wrapper
+│   │   └── llm.py                 # ChatAnthropic + LCEL chain + [#1]-style citation prompt
 │   └── api/main.py                # FastAPI app
 ├── rag_pipelines/                 # Dagster orchestration (optional)
 │   ├── definitions.py             # Definitions entrypoint
@@ -74,19 +77,19 @@ cp .env.example .env
 
 ## The learning path (recommended order)
 
-These standalone scripts walk through each layer in isolation. Run them in order:
+These standalone scripts walk through each LangChain layer in isolation. Run them in order:
 
 ```bash
-# Layer 1: Qdrant mechanics (no embeddings, fake vectors)
+# Layer 1: QdrantVectorStore + raw QdrantClient (front door vs service entrance)
 uv run python -m scripts.learn.qdrant_walkthrough
 
-# Layer 2: Real Voyage embeddings, semantic search
+# Layer 2: VoyageAIEmbeddings via LangChain (doc/query asymmetry, batched embed)
 uv run python -m scripts.learn.voyage_walkthrough
 
-# Layer 3: Chunking strategies compared
+# Layer 3: Text splitters compared (Character / Recursive / Token, w/ and w/o overlap)
 uv run python -m scripts.learn.chunking_walkthrough
 
-# Layer 4: Claude generation, closing the RAG loop
+# Layer 4: ChatAnthropic + LCEL — naked vs grounded, composed RAG chain, streaming
 uv run python -m scripts.learn.generation_walkthrough
 ```
 

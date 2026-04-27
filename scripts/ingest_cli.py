@@ -1,4 +1,4 @@
-"""Ingest PDFs into Qdrant.
+"""Ingest PDFs into Qdrant via the LangChain pipeline.
 
 Usage:
     uv run python -m scripts.ingest_cli ./data/pdfs
@@ -11,7 +11,7 @@ import typer
 from rich import print
 
 from src.ingest.pipeline import ingest_path
-from src.retrieval.store import QdrantStore
+from src.retrieval import store
 
 app = typer.Typer(add_completion=False)
 
@@ -23,13 +23,13 @@ def main(
 ) -> None:
     if reset:
         print("[yellow]Resetting collection...[/yellow]")
-        QdrantStore().reset()
+        store.reset()
 
     print(f"Ingesting [bold]{path}[/bold]...")
     result = ingest_path(path)
     print(f"  pages:  {result['pages']}")
     print(f"  chunks: {result['chunks']}")
-    print(f"  total in collection: {QdrantStore().count()}")
+    print(f"  total in collection: {store.count()}")
     print("[bold green]✓ Done.[/bold green]")
 
 

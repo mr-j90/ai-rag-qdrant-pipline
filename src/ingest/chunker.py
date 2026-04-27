@@ -1,40 +1,31 @@
-"""Chunk page records into overlapping text windows."""
+"""Chunk LangChain Documents into overlapping windows."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
-
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from src.config import get_settings
-from src.ingest.loaders import PageRecord
 
 
-@dataclass
-class Chunk:
-    text: str
-    metadata: dict[str, Any]
+def chunk_documents(documents: list[Document]) -> list[Document]:
+    """Split page-level Documents into chunk-level Documents.
 
-
-def chunk_pages(pages: list[PageRecord]) -> list[Chunk]:
-    settings = get_settings()
+    `split_documents` carries each parent Document's metadata onto every child
+    chunk, so `source` and `page` propagate down for free. We layer
+    `chunk_index` on top so chunks within a page are addressable.
+    """
+    s = get_settings()
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=settings.chunk_size,
-        chunk_overlap=settings.chunk_overlap,
+        chunk_size=s.chunk_size,
+        chunk_overlap=s.chunk_overlap,
         separators=["\n\n", "\n", ". ", " ", ""],
     )
-
-    chunks: list[Chunk] = []
-    for page in pages:
-        for i, piece in enumerate(splitter.split_text(page.text)):
-            chunks.append(
-                Chunk(
-                    text=piece,
-                    metadata={
-                        "source": page.source,
-                        "page": page.page,
-                        "chunk_index": i,
-                    },
-                )
-            )
+    chunks = splitter.split_documents(documents)
+    # Tag chunks with a per-page running index for traceability.
+    page_counters: dict[tuple, int] = {}
+    for c in chunks:
+        key = (c.metadata.get("source"), c.metadata.get("page"))
+        idx = page_counters.get(key, 0)
+        c.metadata["chunk_index"] = idx
+        page_counters[key] = idx + 1
     return chunks

@@ -1,34 +1,30 @@
-"""PDF loader. Returns one record per page so we can attribute chunks to pages."""
+"""PDF loaders via LangChain.
+
+`PyPDFLoader.load()` returns one `Document` per page with `source` (file path)
+and `page` (0-indexed) in metadata. We normalize `source` to the basename so
+filtering and display are stable regardless of where the file lives on disk.
+"""
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 
-import pdfplumber
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.documents import Document
 
 
-@dataclass
-class PageRecord:
-    source: str       # filename (e.g. "anthropic-handbook.pdf")
-    page: int         # 1-indexed page number
-    text: str
-
-
-def load_pdf(path: str | Path) -> list[PageRecord]:
+def load_pdf(path: str | Path) -> list[Document]:
     path = Path(path)
-    records: list[PageRecord] = []
-    with pdfplumber.open(path) as pdf:
-        for i, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text() or ""
-            text = text.strip()
-            if text:
-                records.append(PageRecord(source=path.name, page=i, text=text))
-    return records
+    docs = PyPDFLoader(str(path)).load()
+    for d in docs:
+        # PyPDFLoader uses 0-indexed pages; bump to 1-indexed for display.
+        d.metadata["source"] = path.name
+        d.metadata["page"] = d.metadata.get("page", 0) + 1
+    return [d for d in docs if d.page_content.strip()]
 
 
-def load_pdfs_from_dir(dir_path: str | Path) -> list[PageRecord]:
+def load_pdfs_from_dir(dir_path: str | Path) -> list[Document]:
     dir_path = Path(dir_path)
-    out: list[PageRecord] = []
+    out: list[Document] = []
     for pdf_path in sorted(dir_path.glob("*.pdf")):
         out.extend(load_pdf(pdf_path))
     return out

@@ -1,207 +1,184 @@
 """
-Qdrant walkthrough — learn the vector DB in isolation.
+LangChain × Qdrant walkthrough — learn the storage layer in isolation.
 
-This script uses FAKE (random) vectors so you can focus on Qdrant's mechanics
-without worrying about embeddings yet. We'll run the same sequence of operations
-you'd do in a real RAG pipeline:
+LangChain hides a lot of Qdrant. That's the whole point of using it. But it's
+still useful to see what's happening underneath, so this script walks through:
 
-    1. Connect to Qdrant
-    2. Create a collection
-    3. Insert ("upsert") points
-    4. Inspect what's stored
-    5. Run a vector search
-    6. Run a FILTERED vector search
-    7. Add a payload index
+    1. Create a QdrantVectorStore (LangChain's wrapper)
+    2. Add a few Documents
+    3. Inspect what actually got stored in Qdrant under the hood
+    4. Run a similarity search
+    5. Run a metadata-FILTERED search (the killer feature)
+    6. Use as_retriever() — the Runnable interface
+    7. Drop down to the raw QdrantClient for admin operations
     8. Clean up
 
-Run it section by section. Each block prints what just happened.
+The lesson: LangChain's vector store is the *front door*; QdrantClient is the
+*service entrance*. Use the front door for reads/writes, the service
+entrance for admin (count, reset, list distinct payload values).
 
 Prereq:  docker compose up -d
 Run:     uv run python -m scripts.learn.qdrant_walkthrough
 """
 from __future__ import annotations
 
-import random
-from rich import print
-from rich.rule import Rule
-
+from langchain_core.documents import Document
+from langchain_qdrant import QdrantVectorStore
+from langchain_voyageai import VoyageAIEmbeddings
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
     FieldCondition,
     Filter,
     MatchValue,
-    PayloadSchemaType,
-    PointStruct,
-    Range,
     VectorParams,
 )
+from rich import print
+from rich.rule import Rule
+
+from src.config import get_settings
 
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
 COLLECTION = "qdrant_walkthrough"
-DIM = 8  # tiny dimension so we can actually print vectors and read them
-random.seed(42)
+settings = get_settings()
 
-
-def random_vector() -> list[float]:
-    """Pretend this is what an embedding model returns."""
-    return [round(random.uniform(-1, 1), 3) for _ in range(DIM)]
-
-
-client = QdrantClient(url="http://localhost:6333")
+qdrant = QdrantClient(url=settings.qdrant_url)
+embeddings = VoyageAIEmbeddings(
+    model=settings.voyage_model,
+    api_key=settings.voyage_api_key,
+)
 
 
 # ---------------------------------------------------------------------------
-# 1. Connect & inspect what's already there
+# 1. Create the LangChain-flavored vector store
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]1. Connect & inspect"))
-existing = [c.name for c in client.get_collections().collections]
-print(f"Existing collections: {existing}")
+print(Rule("[bold cyan]1. QdrantVectorStore — LangChain's adapter"))
 
-# Clean slate for this walkthrough
-if COLLECTION in existing:
-    client.delete_collection(COLLECTION)
+if COLLECTION in {c.name for c in qdrant.get_collections().collections}:
+    qdrant.delete_collection(COLLECTION)
     print(f"Deleted old '{COLLECTION}' collection.")
 
-
-# ---------------------------------------------------------------------------
-# 2. Create a collection
-# ---------------------------------------------------------------------------
-print(Rule("[bold cyan]2. Create collection"))
-client.create_collection(
+# QdrantVectorStore needs the collection to exist already (it doesn't auto-create
+# unless you go through `.from_documents`). Create it explicitly so we can show
+# both flows side by side.
+qdrant.create_collection(
     collection_name=COLLECTION,
-    vectors_config=VectorParams(size=DIM, distance=Distance.COSINE),
+    vectors_config=VectorParams(size=settings.embedding_dim, distance=Distance.COSINE),
 )
-info = client.get_collection(COLLECTION)
-print(f"Created '{COLLECTION}'")
-print(f"  vector size:  {info.config.params.vectors.size}")
-print(f"  distance:     {info.config.params.vectors.distance}")
-print(f"  point count:  {info.points_count}")
+
+vector_store = QdrantVectorStore(
+    client=qdrant,
+    collection_name=COLLECTION,
+    embedding=embeddings,
+)
+print(f"Created QdrantVectorStore for collection '{COLLECTION}'.")
+print("[dim]The store is just a thin object — connection + collection name + embedding fn.[/dim]")
 
 
 # ---------------------------------------------------------------------------
-# 3. Upsert some points
+# 2. Add Documents
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]3. Upsert points"))
+print(Rule("[bold cyan]2. Add a few Documents"))
+
 docs = [
-    {"id": 1, "text": "Qdrant is a vector database written in Rust.",      "source": "wiki.pdf",     "page": 1, "topic": "infra"},
-    {"id": 2, "text": "FastAPI is a Python web framework.",                 "source": "fastapi.pdf",  "page": 1, "topic": "web"},
-    {"id": 3, "text": "Voyage AI provides text embeddings.",                "source": "voyage.pdf",   "page": 3, "topic": "ml"},
-    {"id": 4, "text": "Claude is Anthropic's family of LLMs.",              "source": "anthropic.pdf","page": 2, "topic": "ml"},
-    {"id": 5, "text": "RAG combines retrieval with generation.",            "source": "rag.pdf",      "page": 1, "topic": "ml"},
-    {"id": 6, "text": "Cosine similarity measures angle between vectors.",  "source": "math.pdf",     "page": 7, "topic": "math"},
+    Document(page_content="Qdrant is a vector database written in Rust.",
+             metadata={"source": "wiki.pdf", "page": 1, "topic": "infra"}),
+    Document(page_content="FastAPI is a Python web framework.",
+             metadata={"source": "fastapi.pdf", "page": 1, "topic": "web"}),
+    Document(page_content="Voyage AI provides text embeddings.",
+             metadata={"source": "voyage.pdf", "page": 3, "topic": "ml"}),
+    Document(page_content="Claude is Anthropic's family of LLMs.",
+             metadata={"source": "anthropic.pdf", "page": 2, "topic": "ml"}),
+    Document(page_content="RAG combines retrieval with generation.",
+             metadata={"source": "rag.pdf", "page": 1, "topic": "ml"}),
+    Document(page_content="Cosine similarity measures angle between vectors.",
+             metadata={"source": "math.pdf", "page": 7, "topic": "math"}),
 ]
 
-points = [
-    PointStruct(
-        id=d["id"],
-        vector=random_vector(),
-        payload={k: v for k, v in d.items() if k != "id"},
-    )
-    for d in docs
-]
-
-client.upsert(collection_name=COLLECTION, points=points)
-print(f"Upserted {len(points)} points.")
-print(f"Collection count now: {client.count(COLLECTION, exact=True).count}")
+ids = vector_store.add_documents(docs)
+print(f"Added {len(ids)} documents. Collection count: "
+      f"{qdrant.count(COLLECTION, exact=True).count}")
 
 
 # ---------------------------------------------------------------------------
-# 4. Inspect what's stored
+# 3. Peek under the hood — what did LangChain actually write?
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]4. Inspect stored points"))
-fetched = client.retrieve(
-    collection_name=COLLECTION,
-    ids=[1, 3, 5],
-    with_payload=True,
-    with_vectors=True,
+print(Rule("[bold cyan]3. What got stored?"))
+
+raw_points, _ = qdrant.scroll(
+    collection_name=COLLECTION, limit=2, with_payload=True, with_vectors=False
 )
-for p in fetched:
-    print(f"  id={p.id}")
-    print(f"    payload: {p.payload}")
-    print(f"    vector:  {p.vector[:4]}... (truncated)")
+for p in raw_points:
+    print(f"  point id: {p.id}")
+    keys = sorted((p.payload or {}).keys())
+    print(f"  payload keys: {keys}")
+    md = (p.payload or {}).get("metadata") or {}
+    print(f"  metadata: {md}")
+print("[dim]LangChain stores `page_content` + `metadata` as nested keys, plus its own "
+      "internal fields. That's why filters use `metadata.<key>` paths.[/dim]")
 
 
 # ---------------------------------------------------------------------------
-# 5. Vector search (no filter)
+# 4. Similarity search
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]5. Vector search"))
-query_vec = random_vector()
-print(f"Query vector: {query_vec}")
+print(Rule("[bold cyan]4. Similarity search (returns Documents)"))
 
-hits = client.query_points(
-    collection_name=COLLECTION,
-    query=query_vec,
-    limit=3,
-    with_payload=True,
-).points
-
-print(f"\nTop {len(hits)} results:")
-for h in hits:
-    print(f"  score={h.score:+.4f}  id={h.id}  text='{h.payload['text']}'")
-
-
-# ---------------------------------------------------------------------------
-# 6. Filtered search — the killer feature
-# ---------------------------------------------------------------------------
-print(Rule("[bold cyan]6. Filtered vector search"))
-ml_only = Filter(must=[FieldCondition(key="topic", match=MatchValue(value="ml"))])
-
-hits = client.query_points(
-    collection_name=COLLECTION,
-    query=query_vec,
-    query_filter=ml_only,
-    limit=3,
-    with_payload=True,
-).points
-
-print("Filter: topic == 'ml'")
-for h in hits:
-    print(f"  score={h.score:+.4f}  id={h.id}  topic={h.payload['topic']}  text='{h.payload['text']}'")
-
-print("\nFilter: topic == 'ml' AND page <= 2")
-complex_filter = Filter(
-    must=[
-        FieldCondition(key="topic", match=MatchValue(value="ml")),
-        FieldCondition(key="page", range=Range(lte=2)),
-    ]
+hits = vector_store.similarity_search_with_score(
+    "What's a good database for embeddings?", k=3
 )
-hits = client.query_points(
-    collection_name=COLLECTION,
-    query=query_vec,
-    query_filter=complex_filter,
-    limit=3,
-    with_payload=True,
-).points
-for h in hits:
-    print(f"  score={h.score:+.4f}  id={h.id}  page={h.payload['page']}  text='{h.payload['text']}'")
+for doc, score in hits:
+    print(f"  score={score:+.4f}  topic={doc.metadata.get('topic')}  "
+          f"text='{doc.page_content}'")
 
 
 # ---------------------------------------------------------------------------
-# 7. Payload index — speeds up filters at scale
+# 5. Filtered search — the killer feature
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]7. Create a payload index"))
-client.create_payload_index(
-    collection_name=COLLECTION,
-    field_name="topic",
-    field_schema=PayloadSchemaType.KEYWORD,
-)
-client.create_payload_index(
-    collection_name=COLLECTION,
-    field_name="page",
-    field_schema=PayloadSchemaType.INTEGER,
-)
-print("Indexed 'topic' (keyword) and 'page' (integer).")
+print(Rule("[bold cyan]5. Filtered search via qdrant Filter objects"))
 
-info = client.get_collection(COLLECTION)
-print(f"Payload schema now: {info.payload_schema}")
+ml_only = Filter(
+    must=[FieldCondition(key="metadata.topic", match=MatchValue(value="ml"))]
+)
+filtered = vector_store.similarity_search_with_score(
+    "Tell me about machine learning", k=3, filter=ml_only
+)
+print("Filter: metadata.topic == 'ml'")
+for doc, score in filtered:
+    print(f"  score={score:+.4f}  topic={doc.metadata.get('topic')}  "
+          f"text='{doc.page_content}'")
+
+
+# ---------------------------------------------------------------------------
+# 6. as_retriever() — the Runnable interface
+# ---------------------------------------------------------------------------
+print(Rule("[bold cyan]6. as_retriever() — plug into LCEL chains"))
+
+retriever = vector_store.as_retriever(search_kwargs={"k": 2, "filter": ml_only})
+# Retrievers ARE Runnables: .invoke / .batch / .stream all work.
+docs_only = retriever.invoke("Tell me about LLMs")
+for d in docs_only:
+    print(f"  {d.page_content}  ({d.metadata.get('source')})")
+print("[dim]The retriever drops scores — use similarity_search_with_score if you need them.[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# 7. Service entrance — raw QdrantClient for admin
+# ---------------------------------------------------------------------------
+print(Rule("[bold cyan]7. Raw QdrantClient for admin operations"))
+
+# LangChain doesn't expose collection count, payload listing, etc.
+# Drop down to qdrant_client when you need it.
+print(f"Collection count: {qdrant.count(COLLECTION, exact=True).count}")
+info = qdrant.get_collection(COLLECTION)
+print(f"Vector size: {info.config.params.vectors.size}")
+print(f"Distance:    {info.config.params.vectors.distance}")
 
 
 # ---------------------------------------------------------------------------
 # 8. Cleanup
 # ---------------------------------------------------------------------------
 print(Rule("[bold cyan]8. Cleanup"))
-print(f"Collection '{COLLECTION}' kept around. Visit http://localhost:6333/dashboard to explore.")
+print(f"Collection '{COLLECTION}' kept around. http://localhost:6333/dashboard to explore.")
 print("[bold green]✓ Walkthrough complete.[/bold green]")

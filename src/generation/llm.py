@@ -1,14 +1,28 @@
-"""Claude wrapper for the generation step. Builds a context-grounded prompt
-from retrieved chunks and asks Claude to answer with inline citations."""
+"""Retrieval + Claude generation, glued together with LangChain (LCEL).
+
+We don't use the off-the-shelf `RetrievalQA` chain because we want full
+control over the prompt — specifically the [#1], [#2] citation style that
+the API contract and Streamlit UI both depend on. The retriever and the LLM
+both come from LangChain; only the prompt assembly is ours.
+
+The "answer" half is LCEL — `prompt | llm | parser`. The "retrieval" half is
+imperative because we need the retrieved docs both for the prompt AND for the
+sources payload that goes back to the UI.
+"""
 from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from functools import lru_cache
 
-from anthropic import Anthropic
+from langchain_anthropic import ChatAnthropic
+from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from qdrant_client.models import FieldCondition, Filter, MatchValue
 
 from src.config import get_settings
-from src.retrieval.store import SearchResult
+from src.retrieval.store import get_vector_store
 
 
 SYSTEM_PROMPT = """You are a helpful research assistant.
@@ -24,56 +38,99 @@ class GenerationResult:
     sources: list[dict]
 
 
-def _build_context(results: list[SearchResult]) -> str:
+@lru_cache
+def get_llm() -> ChatAnthropic:
+    s = get_settings()
+    return ChatAnthropic(
+        model=s.anthropic_model,
+        api_key=s.anthropic_api_key,
+        max_tokens=1024,
+    )
+
+
+@lru_cache
+def get_prompt() -> ChatPromptTemplate:
+    return ChatPromptTemplate.from_messages(
+        [
+            ("system", SYSTEM_PROMPT),
+            ("user", "Context:\n{context}\n\nQuestion: {question}"),
+        ]
+    )
+
+
+@lru_cache
+def get_chain():
+    """LCEL chain: prompt | llm | StrOutputParser. Same chain for sync + stream."""
+    return get_prompt() | get_llm() | StrOutputParser()
+
+
+def _retrieve(question: str, top_k: int, source_filter: str | None) -> list[Document]:
+    """Use similarity_search_with_score so we can keep scores in the sources payload.
+    The standard `as_retriever()` path drops them."""
+    qfilter = None
+    if source_filter:
+        # LangChain's QdrantVectorStore stores metadata nested under the `metadata`
+        # payload key, so the filter path is `metadata.source`.
+        qfilter = Filter(
+            must=[FieldCondition(key="metadata.source", match=MatchValue(value=source_filter))]
+        )
+    pairs = get_vector_store().similarity_search_with_score(
+        question, k=top_k, filter=qfilter
+    )
+    docs: list[Document] = []
+    for doc, score in pairs:
+        doc.metadata["_score"] = float(score)
+        docs.append(doc)
+    return docs
+
+
+def _build_context(docs: list[Document]) -> str:
     lines = []
-    for i, r in enumerate(results, start=1):
-        src = r.metadata.get("source", "unknown")
-        page = r.metadata.get("page", "?")
-        lines.append(f"[#{i}] (source: {src}, page: {page})\n{r.text}")
+    for i, d in enumerate(docs, start=1):
+        meta = d.metadata or {}
+        src = meta.get("source", "unknown")
+        page = meta.get("page", "?")
+        lines.append(f"[#{i}] (source: {src}, page: {page})\n{d.page_content}")
     return "\n\n---\n\n".join(lines)
 
 
-def _sources_payload(results: list[SearchResult]) -> list[dict]:
-    return [
-        {
-            "label": f"#{i}",
-            "source": r.metadata.get("source"),
-            "page": r.metadata.get("page"),
-            "score": round(r.score, 4),
-            "preview": r.text[:200],
-        }
-        for i, r in enumerate(results, start=1)
-    ]
-
-
-class ClaudeGenerator:
-    def __init__(self) -> None:
-        settings = get_settings()
-        self.client = Anthropic(api_key=settings.anthropic_api_key)
-        self.model = settings.anthropic_model
-
-    def answer(self, question: str, results: list[SearchResult]) -> GenerationResult:
-        context = _build_context(results)
-        user_msg = f"Context:\n{context}\n\nQuestion: {question}"
-
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_msg}],
+def _sources_payload(docs: list[Document]) -> list[dict]:
+    out = []
+    for i, d in enumerate(docs, start=1):
+        meta = d.metadata or {}
+        out.append(
+            {
+                "label": f"#{i}",
+                "source": meta.get("source"),
+                "page": meta.get("page"),
+                "score": round(meta["_score"], 4) if "_score" in meta else None,
+                "preview": d.page_content[:200],
+            }
         )
-        text = "".join(block.text for block in response.content if block.type == "text")
-        return GenerationResult(answer=text, sources=_sources_payload(results))
+    return out
 
-    def stream_answer(self, question: str, results: list[SearchResult]) -> Iterator[str]:
-        context = _build_context(results)
-        user_msg = f"Context:\n{context}\n\nQuestion: {question}"
 
-        with self.client.messages.stream(
-            model=self.model,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_msg}],
-        ) as stream:
-            for delta in stream.text_stream:
-                yield delta
+def answer(
+    question: str, top_k: int, source_filter: str | None = None
+) -> tuple[GenerationResult, list[Document]]:
+    """Retrieve + generate. Returns the answer payload AND the raw docs
+    so callers can detect "no hits" without re-retrieving."""
+    docs = _retrieve(question, top_k, source_filter)
+    if not docs:
+        return GenerationResult(answer="", sources=[]), docs
+
+    text = get_chain().invoke({"context": _build_context(docs), "question": question})
+    return GenerationResult(answer=text, sources=_sources_payload(docs)), docs
+
+
+def stream_answer(
+    question: str, top_k: int, source_filter: str | None = None
+) -> tuple[Iterator[str], list[dict]]:
+    """Retrieve + stream. Returns (token_iterator, sources_payload).
+    Sources are returned eagerly so SSE callers can emit them before the first token."""
+    docs = _retrieve(question, top_k, source_filter)
+    if not docs:
+        return iter(()), []
+
+    chunks = get_chain().stream({"context": _build_context(docs), "question": question})
+    return chunks, _sources_payload(docs)

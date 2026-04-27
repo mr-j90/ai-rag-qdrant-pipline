@@ -1,126 +1,100 @@
-"""Qdrant client wrapper — collection lifecycle, upsert, search."""
+"""Qdrant store via LangChain `QdrantVectorStore` plus a few admin helpers.
+
+LangChain's `QdrantVectorStore` owns the read/write path (add_documents,
+similarity_search, as_retriever). The raw `QdrantClient` is only used for
+collection-level admin (count, reset, list distinct sources) that LangChain
+doesn't expose.
+"""
 from __future__ import annotations
 
-import uuid
-from dataclasses import dataclass
-from typing import Any
+from functools import lru_cache
 
+from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
-from qdrant_client.models import (
-    Distance,
-    FieldCondition,
-    Filter,
-    MatchValue,
-    PointStruct,
-    VectorParams,
-)
+from qdrant_client.models import Distance, VectorParams
 
 from src.config import get_settings
+from src.retrieval.embeddings import get_embeddings
 
 
-@dataclass
-class SearchResult:
-    id: str
-    score: float
-    text: str
-    metadata: dict[str, Any]
+@lru_cache
+def get_qdrant_client() -> QdrantClient:
+    return QdrantClient(url=get_settings().qdrant_url)
 
 
-class QdrantStore:
-    def __init__(self) -> None:
-        settings = get_settings()
-        self.client = QdrantClient(url=settings.qdrant_url)
-        self.collection = settings.qdrant_collection
-        self.dim = settings.embedding_dim
+def _ensure_collection() -> None:
+    s = get_settings()
+    client = get_qdrant_client()
+    if s.qdrant_collection not in {c.name for c in client.get_collections().collections}:
+        client.create_collection(
+            collection_name=s.qdrant_collection,
+            vectors_config=VectorParams(size=s.embedding_dim, distance=Distance.COSINE),
+        )
 
-    def ensure_collection(self) -> None:
-        """Create the collection if it doesn't already exist."""
-        existing = {c.name for c in self.client.get_collections().collections}
-        if self.collection not in existing:
-            self.client.create_collection(
-                collection_name=self.collection,
-                vectors_config=VectorParams(size=self.dim, distance=Distance.COSINE),
-            )
 
-    def upsert(
-        self,
-        texts: list[str],
-        embeddings: list[list[float]],
-        metadatas: list[dict[str, Any]],
-    ) -> list[str]:
-        """Insert or update points. Returns the assigned IDs."""
-        assert len(texts) == len(embeddings) == len(metadatas), "length mismatch"
-        ids = [str(uuid.uuid4()) for _ in texts]
-        points = [
-            PointStruct(
-                id=pid,
-                vector=vec,
-                payload={"text": txt, **meta},
-            )
-            for pid, vec, txt, meta in zip(ids, embeddings, texts, metadatas)
-        ]
-        self.client.upsert(collection_name=self.collection, points=points)
-        return ids
+@lru_cache
+def get_vector_store() -> QdrantVectorStore:
+    s = get_settings()
+    _ensure_collection()
+    return QdrantVectorStore(
+        client=get_qdrant_client(),
+        collection_name=s.qdrant_collection,
+        embedding=get_embeddings(),
+    )
 
-    def search(
-        self,
-        query_vector: list[float],
-        top_k: int = 5,
-        source_filter: str | None = None,
-    ) -> list[SearchResult]:
-        """Vector search with optional source filename filter."""
-        qfilter = None
-        if source_filter:
-            qfilter = Filter(
-                must=[FieldCondition(key="source", match=MatchValue(value=source_filter))]
-            )
-        hits = self.client.query_points(
-            collection_name=self.collection,
-            query=query_vector,
-            limit=top_k,
-            query_filter=qfilter,
-            with_payload=True,
-        ).points
-        return [
-            SearchResult(
-                id=str(h.id),
-                score=h.score,
-                text=h.payload.get("text", ""),
-                metadata={k: v for k, v in h.payload.items() if k != "text"},
-            )
-            for h in hits
-        ]
 
-    def count(self) -> int:
-        return self.client.count(collection_name=self.collection, exact=True).count
+def collection_exists() -> bool:
+    s = get_settings()
+    return s.qdrant_collection in {
+        c.name for c in get_qdrant_client().get_collections().collections
+    }
 
-    def list_sources(self) -> list[str]:
-        """Distinct source filenames currently in the collection.
 
-        Uses scroll() rather than facets to avoid requiring a payload index.
-        Fine for playground-sized collections; for large ones, switch to
-        client.facet() with a keyword index on `source`.
-        """
-        sources: set[str] = set()
-        next_offset = None
-        while True:
-            points, next_offset = self.client.scroll(
-                collection_name=self.collection,
-                with_payload=["source"],
-                with_vectors=False,
-                limit=256,
-                offset=next_offset,
-            )
-            for p in points:
-                src = (p.payload or {}).get("source")
-                if src:
-                    sources.add(src)
-            if next_offset is None:
-                break
-        return sorted(sources)
+def count() -> int:
+    """Total points in the collection. 0 if the collection doesn't exist yet."""
+    if not collection_exists():
+        return 0
+    s = get_settings()
+    return get_qdrant_client().count(collection_name=s.qdrant_collection, exact=True).count
 
-    def reset(self) -> None:
-        """Delete and recreate the collection. Useful during development."""
-        if self.collection in {c.name for c in self.client.get_collections().collections}:
-            self.client.delete_collection(self.collection)
-        self.ensure_collection()
+
+def list_sources() -> list[str]:
+    """Distinct `source` values in the collection.
+
+    LangChain's QdrantVectorStore stores Document.metadata nested under the
+    `metadata` payload key, so we look for `metadata.source`. Uses scroll()
+    rather than facets to avoid requiring a payload index — fine for
+    playground-sized collections.
+    """
+    if not collection_exists():
+        return []
+    s = get_settings()
+    client = get_qdrant_client()
+    sources: set[str] = set()
+    next_offset = None
+    while True:
+        points, next_offset = client.scroll(
+            collection_name=s.qdrant_collection,
+            with_payload=["metadata"],
+            with_vectors=False,
+            limit=256,
+            offset=next_offset,
+        )
+        for p in points:
+            meta = (p.payload or {}).get("metadata") or {}
+            name = meta.get("source")
+            if name:
+                sources.add(name)
+        if next_offset is None:
+            break
+    return sorted(sources)
+
+
+def reset() -> None:
+    """Delete the collection so the next write recreates it. Useful in dev."""
+    s = get_settings()
+    client = get_qdrant_client()
+    if collection_exists():
+        client.delete_collection(s.qdrant_collection)
+    # Bust caches — the dropped collection is referenced inside.
+    get_vector_store.cache_clear()

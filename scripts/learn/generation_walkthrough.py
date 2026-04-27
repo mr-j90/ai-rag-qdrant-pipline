@@ -1,52 +1,64 @@
 """
-Claude generation walkthrough — close the RAG loop.
+LangChain generation walkthrough — close the RAG loop with LCEL.
 
-This is the payoff. We're going to:
+The pieces:
+    - QdrantVectorStore       — already familiar from earlier walkthroughs
+    - ChatAnthropic           — LangChain's wrapper around the Claude API
+    - ChatPromptTemplate      — the prompt
+    - StrOutputParser         — extracts the .content string from the AIMessage
+    - LCEL pipe operator (|)  — composes Runnables into a chain
 
-    1. Build a small RAG corpus (using everything you've learned: chunk + embed + index)
-    2. Make a NAKED call to Claude (no context) — see how it does
-    3. Make a GROUNDED call (with retrieved context) — see the difference
-    4. Watch what happens when the context doesn't actually contain the answer
-    5. Compare temperature 0.0 vs 0.7 — see grounding vs creativity tradeoff
-    6. Stream a response token-by-token — see the UX upgrade
+We'll:
+    1. Build a small RAG corpus (Document → split → embed → index)
+    2. Ask Claude WITHOUT context (baseline)
+    3. Build an LCEL chain: prompt | llm | parser, run it grounded
+    4. Add the retriever to the chain so it auto-fetches context
+    5. The honesty test — out-of-scope question
+    6. Stream a response token-by-token
 
 Prereqs:
     - docker compose up -d
-    - VOYAGE_API_KEY and ANTHROPIC_API_KEY in environment
+    - VOYAGE_API_KEY and ANTHROPIC_API_KEY in .env
 
 Run:
     uv run python -m scripts.learn.generation_walkthrough
 """
 from __future__ import annotations
 
-import os
 import textwrap
 
-import voyageai
-from anthropic import Anthropic
+from langchain_anthropic import ChatAnthropic
+from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_qdrant import QdrantVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_voyageai import VoyageAIEmbeddings
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import Distance, VectorParams
 from rich import print
 from rich.panel import Panel
 from rich.rule import Rule
+
+from src.config import get_settings
 
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
 COLLECTION = "generation_walkthrough"
-EMBED_MODEL = "voyage-3"
-DIM = 1024
-CLAUDE_MODEL = "claude-sonnet-4-6"
+settings = get_settings()
 
-if not os.getenv("VOYAGE_API_KEY"):
-    raise SystemExit("Set VOYAGE_API_KEY first.")
-if not os.getenv("ANTHROPIC_API_KEY"):
-    raise SystemExit("Set ANTHROPIC_API_KEY first.")
-
-vo = voyageai.Client()
-qdrant = QdrantClient(url="http://localhost:6333")
-claude = Anthropic()
+embeddings = VoyageAIEmbeddings(
+    model=settings.voyage_model,
+    api_key=settings.voyage_api_key,
+)
+llm = ChatAnthropic(
+    model=settings.anthropic_model,
+    api_key=settings.anthropic_api_key,
+    max_tokens=1024,
+)
+qdrant = QdrantClient(url=settings.qdrant_url)
 
 
 DOCUMENT = textwrap.dedent("""\
@@ -82,202 +94,146 @@ DOCUMENT = textwrap.dedent("""\
 
 
 # ---------------------------------------------------------------------------
-# 0. Setup the corpus
+# 0. Build the corpus
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]0. Build the corpus (chunk → embed → index)"))
-
-splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=80)
-chunks = splitter.split_text(DOCUMENT)
-print(f"Chunked into {len(chunks)} pieces.")
+print(Rule("[bold cyan]0. Build the corpus (Document → split → embed → index)"))
 
 if COLLECTION in {c.name for c in qdrant.get_collections().collections}:
     qdrant.delete_collection(COLLECTION)
 qdrant.create_collection(
     collection_name=COLLECTION,
-    vectors_config=VectorParams(size=DIM, distance=Distance.COSINE),
+    vectors_config=VectorParams(size=settings.embedding_dim, distance=Distance.COSINE),
 )
 
-embeddings = vo.embed(chunks, model=EMBED_MODEL, input_type="document").embeddings
-qdrant.upsert(
-    collection_name=COLLECTION,
-    points=[
-        PointStruct(
-            id=i,
-            vector=v,
-            payload={"text": t, "source": "remote_work_policy.md", "chunk_index": i},
-        )
-        for i, (t, v) in enumerate(zip(chunks, embeddings))
-    ],
+splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=80)
+chunks = splitter.split_documents(
+    [Document(page_content=DOCUMENT, metadata={"source": "remote_work_policy.md"})]
 )
-print(f"Indexed {len(chunks)} chunks. Ready.\n")
+print(f"Split into {len(chunks)} chunks.")
+
+vector_store = QdrantVectorStore(
+    client=qdrant, collection_name=COLLECTION, embedding=embeddings
+)
+vector_store.add_documents(chunks)
+print("Indexed.\n")
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# 1. Naked Claude (no context)
 # ---------------------------------------------------------------------------
-def retrieve(question: str, k: int = 3) -> list[dict]:
-    qvec = vo.embed([question], model=EMBED_MODEL, input_type="query").embeddings[0]
-    hits = qdrant.query_points(
-        collection_name=COLLECTION, query=qvec, limit=k, with_payload=True
-    ).points
-    return [
-        {
-            "label": f"#{i + 1}",
-            "text": h.payload["text"],
-            "source": h.payload["source"],
-            "chunk_index": h.payload["chunk_index"],
-            "score": h.score,
-        }
-        for i, h in enumerate(hits)
-    ]
-
-
-def format_context(hits: list[dict]) -> str:
-    blocks = []
-    for h in hits:
-        blocks.append(
-            f"[{h['label']}] (source: {h['source']}, chunk: {h['chunk_index']})\n{h['text']}"
-        )
-    return "\n\n---\n\n".join(blocks)
-
-
-SYSTEM_GROUNDED = """You are a helpful research assistant.
-Answer the user's question using ONLY the provided context passages.
-Each passage is labeled like [#1], [#2], etc.
-Cite the passages you used inline using the same labels (e.g. "as shown in [#2]").
-If the context does not contain the answer, say so honestly. Do not invent facts."""
-
-SYSTEM_NAKED = "You are a helpful assistant."
-
-
-def ask_claude(system: str, user_msg: str, temperature: float = 0.0) -> str:
-    response = claude.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=1024,
-        temperature=temperature,
-        system=system,
-        messages=[{"role": "user", "content": user_msg}],
-    )
-    return "".join(block.text for block in response.content if block.type == "text")
-
-
-# ---------------------------------------------------------------------------
-# 1. NAKED Claude — no context at all
-# ---------------------------------------------------------------------------
-print(Rule("[bold cyan]1. Ask Claude WITHOUT any context (the baseline)"))
+print(Rule("[bold cyan]1. Ask Claude WITHOUT any context"))
 
 question = "What is the equipment stipend for remote workers at Acme Corp?"
 print(f"[bold]Question:[/bold] {question}\n")
 
-naked_answer = ask_claude(SYSTEM_NAKED, question)
-print(Panel(naked_answer, title="Naked Claude", border_style="yellow"))
-print(
-    "[dim]Notice: Claude has NO IDEA about Acme Corp's specific policies. It either makes "
-    "something up, gives generic info, or admits ignorance. This is what 'no RAG' looks like.[/dim]\n"
+# Even at this level, ChatAnthropic IS a Runnable, so .invoke works.
+naked_msg = llm.invoke(question)
+print(Panel(naked_msg.content, title="Naked Claude", border_style="yellow"))
+print("[dim]Claude has no idea about Acme Corp's specific policies.[/dim]\n")
+
+
+# ---------------------------------------------------------------------------
+# 2. The LCEL chain — prompt | llm | parser
+# ---------------------------------------------------------------------------
+print(Rule("[bold cyan]2. Build a basic LCEL chain"))
+
+PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a helpful research assistant. Answer using ONLY the provided context. "
+            "Each passage is labeled like [#1], [#2]. Cite passages inline with the same labels. "
+            "If the context doesn't contain the answer, say so honestly.",
+        ),
+        ("user", "Context:\n{context}\n\nQuestion: {question}"),
+    ]
 )
 
+chain = PROMPT | llm | StrOutputParser()
+print("[dim]chain = prompt | llm | parser  (every | is a Runnable composition).[/dim]\n")
+
 
 # ---------------------------------------------------------------------------
-# 2. GROUNDED Claude — with retrieved context
+# 3. Grounded answer — manual retrieval, manual context formatting
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]2. Ask Claude WITH retrieved context (the RAG payoff)"))
+print(Rule("[bold cyan]3. Grounded RAG (manual retrieve → format → run chain)"))
 
-hits = retrieve(question, k=3)
-print(f"Retrieved {len(hits)} chunks. Top scores: {[round(h['score'], 3) for h in hits]}\n")
 
-context = format_context(hits)
-user_msg = f"Context:\n{context}\n\nQuestion: {question}"
+def format_docs(docs: list[Document]) -> str:
+    blocks = []
+    for i, d in enumerate(docs, start=1):
+        meta = d.metadata or {}
+        blocks.append(
+            f"[#{i}] (source: {meta.get('source', 'unknown')}, page: {meta.get('page', '?')})\n"
+            f"{d.page_content}"
+        )
+    return "\n\n---\n\n".join(blocks)
 
-print("[dim]The actual prompt being sent to Claude:[/dim]")
-print(Panel(user_msg, title="User message", border_style="blue", width=100))
-print()
 
-grounded_answer = ask_claude(SYSTEM_GROUNDED, user_msg)
-print(Panel(grounded_answer, title="Grounded Claude", border_style="green"))
-print(
-    "[dim]Notice: Claude answers with the SPECIFIC fact from the document AND cites it. "
-    "This is the entire promise of RAG — turning a generic LLM into a domain expert.[/dim]\n"
+pairs = vector_store.similarity_search_with_score(question, k=3)
+hits = [doc for doc, _ in pairs]
+print(f"Retrieved {len(hits)} chunks. Top scores: {[round(s, 3) for _, s in pairs]}\n")
+
+answer = chain.invoke({"context": format_docs(hits), "question": question})
+print(Panel(answer, title="Grounded Claude", border_style="green"))
+
+
+# ---------------------------------------------------------------------------
+# 4. Composed RAG chain — retriever folded in
+# ---------------------------------------------------------------------------
+print(Rule("[bold cyan]4. Compose the retriever into the chain"))
+
+retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+
+# A composed RAG chain. The trick: `RunnablePassthrough.assign` keeps the
+# original input dict (which has `question`) and adds new keys to it.
+# We compute `context` from the retriever, then route the dict into the chain.
+rag_chain = (
+    RunnablePassthrough.assign(
+        context=(lambda x: x["question"]) | retriever | format_docs
+    )
+    | chain
 )
 
+q2 = "What's the application process for remote work?"
+print(f"[bold]Question:[/bold] {q2}\n")
+out = rag_chain.invoke({"question": q2})
+print(Panel(out, title="Composed RAG chain", border_style="green"))
+
 
 # ---------------------------------------------------------------------------
-# 3. The honesty test
+# 5. The honesty test
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]3. The honesty test — out-of-scope question"))
+print(Rule("[bold cyan]5. The honesty test — out-of-scope question"))
 
 oos_question = "What's Acme Corp's parental leave policy?"
 print(f"[bold]Question:[/bold] {oos_question}")
 print("[dim](This document doesn't say anything about parental leave.)[/dim]\n")
 
-oos_hits = retrieve(oos_question, k=3)
-print(f"Retrieved chunks anyway (top scores: {[round(h['score'], 3) for h in oos_hits]})")
-print("[dim]Note the lower scores — vector search returns SOMETHING, even when nothing fits.[/dim]\n")
-
-oos_context = format_context(oos_hits)
-oos_user = f"Context:\n{oos_context}\n\nQuestion: {oos_question}"
-oos_answer = ask_claude(SYSTEM_GROUNDED, oos_user)
+oos_answer = rag_chain.invoke({"question": oos_question})
 print(Panel(oos_answer, title="Grounded Claude (out-of-scope)", border_style="red"))
-print(
-    "[dim]A well-grounded RAG should say 'I don't know' rather than confabulate. "
-    "If you see Claude make something up here, the system prompt isn't strict enough.[/dim]\n"
-)
+print("[dim]A well-grounded RAG should say 'I don't know' rather than confabulate.[/dim]\n")
 
 
 # ---------------------------------------------------------------------------
-# 4. Temperature comparison
+# 6. Streaming
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]4. Temperature: 0.0 vs 0.7"))
+print(Rule("[bold cyan]6. Streaming response (.stream() works on any Runnable)"))
 
-temp_question = "Summarize the security requirements for remote workers."
-temp_hits = retrieve(temp_question, k=3)
-temp_user = f"Context:\n{format_context(temp_hits)}\n\nQuestion: {temp_question}"
-
-print(f"[bold]Question:[/bold] {temp_question}\n")
-
-answer_strict = ask_claude(SYSTEM_GROUNDED, temp_user, temperature=0.0)
-answer_loose = ask_claude(SYSTEM_GROUNDED, temp_user, temperature=0.7)
-
-print(Panel(answer_strict, title="temperature=0.0 (deterministic)", border_style="cyan"))
-print(Panel(answer_loose, title="temperature=0.7 (creative)", border_style="magenta"))
-print(
-    "[dim]temp=0.0 is reproducible and tightly grounded — same input, same output. "
-    "temp=0.7 has more variation and may rephrase more creatively. For RAG, lower is "
-    "usually better.[/dim]\n"
-)
-
-
-# ---------------------------------------------------------------------------
-# 5. Streaming
-# ---------------------------------------------------------------------------
-print(Rule("[bold cyan]5. Streaming response (watch tokens arrive live)"))
-
-stream_question = "What's the application process for remote work?"
-stream_hits = retrieve(stream_question, k=3)
-stream_user = f"Context:\n{format_context(stream_hits)}\n\nQuestion: {stream_question}"
-
+stream_question = "Summarize the security requirements for remote workers."
 print(f"[bold]Question:[/bold] {stream_question}\n")
 print("[bold]Streamed answer:[/bold]")
 
-with claude.messages.stream(
-    model=CLAUDE_MODEL,
-    max_tokens=1024,
-    temperature=0.0,
-    system=SYSTEM_GROUNDED,
-    messages=[{"role": "user", "content": stream_user}],
-) as stream:
-    for delta in stream.text_stream:
-        print(delta, end="", flush=True)
+for chunk in rag_chain.stream({"question": stream_question}):
+    print(chunk, end="", flush=True)
 print("\n")
-
-print(
-    "[dim]Same answer as non-streaming, but tokens arrive incrementally. This is what "
-    "you'll wire into the FastAPI endpoint via Server-Sent Events for the UI.[/dim]\n"
-)
+print("[dim]Same chain, different method — `.stream()` returns an iterator of partial outputs. "
+      "Plug into FastAPI's StreamingResponse for SSE.[/dim]\n")
 
 
 # ---------------------------------------------------------------------------
-# 6. Done
+# 7. Done
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]6. Done"))
+print(Rule("[bold cyan]7. Done"))
 print(f"Collection '{COLLECTION}' preserved at http://localhost:6333/dashboard")
-print("[bold green]✓ Walkthrough complete. You've seen end-to-end RAG.[/bold green]")
+print("[bold green]✓ Walkthrough complete. End-to-end RAG via LangChain LCEL.[/bold green]")

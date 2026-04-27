@@ -1,6 +1,7 @@
 """Phase 1 / Step 3 — hardcoded smoke test.
 
-Verifies your Voyage + Qdrant pipeline works end-to-end before you touch any PDFs.
+Verifies your Voyage + Qdrant + LangChain pipeline works end-to-end before
+you touch any PDFs.
 
 Run AFTER: docker compose up -d  (and uv sync, and .env populated)
 
@@ -9,10 +10,11 @@ Usage:
 """
 from __future__ import annotations
 
+from langchain_core.documents import Document
 from rich import print
 
-from src.retrieval.embeddings import VoyageEmbedder
-from src.retrieval.store import QdrantStore
+from src.retrieval import store
+from src.retrieval.store import get_vector_store
 
 DOCS = [
     "Qdrant is an open-source vector database written in Rust.",
@@ -27,24 +29,16 @@ QUERY = "What database should I use to store embeddings?"
 def main() -> None:
     print("[bold cyan]== Smoke test ==[/bold cyan]")
 
-    embedder = VoyageEmbedder()
-    store = QdrantStore()
     store.reset()  # fresh collection for the smoke test
 
-    print(f"Embedding {len(DOCS)} docs with Voyage...")
-    vectors = embedder.embed_documents(DOCS)
-    print(f"  vector dim = {len(vectors[0])}")
-
-    metadatas = [{"source": "smoke_test", "page": 0, "chunk_index": i} for i in range(len(DOCS))]
-    ids = store.upsert(texts=DOCS, embeddings=vectors, metadatas=metadatas)
+    documents = [Document(page_content=t, metadata={"source": "smoke_test"}) for t in DOCS]
+    vs = get_vector_store()
+    ids = vs.add_documents(documents)
     print(f"Upserted {len(ids)} points. Collection count = {store.count()}")
 
     print(f"\n[bold]Query:[/bold] {QUERY}")
-    qvec = embedder.embed_query(QUERY)
-    hits = store.search(query_vector=qvec, top_k=3)
-
-    for h in hits:
-        print(f"  [green]{h.score:.4f}[/green]  {h.text}")
+    for doc, score in vs.similarity_search_with_score(QUERY, k=3):
+        print(f"  [green]{score:.4f}[/green]  {doc.page_content}")
 
     print("\n[bold green]✓ Pipeline works end-to-end.[/bold green]")
 

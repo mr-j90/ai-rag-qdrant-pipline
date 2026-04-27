@@ -1,23 +1,15 @@
-"""Orchestrate load -> chunk -> embed -> upsert."""
+"""Orchestrate load -> chunk -> embed -> upsert via the LangChain stack.
+
+`QdrantVectorStore.add_documents(...)` handles batching, embedding (via the
+embedding function bound to the store), and upsert in one call.
+"""
 from __future__ import annotations
 
 from pathlib import Path
 
-from src.ingest.chunker import chunk_pages
+from src.ingest.chunker import chunk_documents
 from src.ingest.loaders import load_pdf, load_pdfs_from_dir
-from src.retrieval.embeddings import VoyageEmbedder
-from src.retrieval.store import QdrantStore
-
-
-def _embed_in_batches(
-    embedder: VoyageEmbedder, texts: list[str], batch_size: int = 64
-) -> list[list[float]]:
-    """Voyage has per-request token limits; batching keeps us safe and parallelizable later."""
-    all_vectors: list[list[float]] = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-        all_vectors.extend(embedder.embed_documents(batch))
-    return all_vectors
+from src.retrieval.store import get_vector_store
 
 
 def ingest_path(path: str | Path) -> dict:
@@ -33,15 +25,6 @@ def ingest_path(path: str | Path) -> dict:
     if not pages:
         return {"pages": 0, "chunks": 0, "ids": []}
 
-    chunks = chunk_pages(pages)
-    texts = [c.text for c in chunks]
-    metadatas = [c.metadata for c in chunks]
-
-    embedder = VoyageEmbedder()
-    vectors = _embed_in_batches(embedder, texts)
-
-    store = QdrantStore()
-    store.ensure_collection()
-    ids = store.upsert(texts=texts, embeddings=vectors, metadatas=metadatas)
-
+    chunks = chunk_documents(pages)
+    ids = get_vector_store().add_documents(chunks)
     return {"pages": len(pages), "chunks": len(chunks), "ids": ids}
