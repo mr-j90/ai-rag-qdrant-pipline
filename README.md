@@ -1,3 +1,5 @@
+- Chack out the different braches for `llamaindex-dag-pipeline` and `langchain-dag-pipeline`
+
 # RAG · Qdrant + Voyage + Claude
 
 End-to-end local RAG: ingest PDFs → Qdrant → query via FastAPI → answer with Claude.
