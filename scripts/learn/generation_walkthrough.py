@@ -1,52 +1,64 @@
 """
-Claude generation walkthrough — close the RAG loop.
+LlamaIndex generation walkthrough — close the RAG loop with query engines.
 
-This is the payoff. We're going to:
+The pieces:
+    - VectorStoreIndex      — already familiar from earlier walkthroughs
+    - Anthropic LLM         — LlamaIndex's wrapper around the Claude API
+    - RetrieverQueryEngine  — glues retriever + LLM + a response synthesizer
+    - .query() / .stream()  — the call you actually make
 
-    1. Build a small RAG corpus (using everything you've learned: chunk + embed + index)
-    2. Make a NAKED call to Claude (no context) — see how it does
-    3. Make a GROUNDED call (with retrieved context) — see the difference
-    4. Watch what happens when the context doesn't actually contain the answer
-    5. Compare temperature 0.0 vs 0.7 — see grounding vs creativity tradeoff
-    6. Stream a response token-by-token — see the UX upgrade
+We'll:
+    1. Build a small RAG corpus (Document → SentenceSplitter → embed → index)
+    2. Ask Claude WITHOUT context (baseline)
+    3. Ask Claude through a RetrieverQueryEngine (the RAG payoff)
+    4. The honesty test — out-of-scope question
+    5. Stream a response token-by-token
 
 Prereqs:
     - docker compose up -d
-    - VOYAGE_API_KEY and ANTHROPIC_API_KEY in environment
+    - VOYAGE_API_KEY and ANTHROPIC_API_KEY in .env
 
 Run:
     uv run python -m scripts.learn.generation_walkthrough
 """
 from __future__ import annotations
 
-import os
 import textwrap
 
-import voyageai
-from anthropic import Anthropic
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from llama_index.core import (
+    Document,
+    PromptTemplate,
+    StorageContext,
+    VectorStoreIndex,
+)
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.response_synthesizers import ResponseMode
+from llama_index.embeddings.voyageai import VoyageEmbedding
+from llama_index.llms.anthropic import Anthropic
+from llama_index.vector_stores.qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
 from rich import print
 from rich.panel import Panel
 from rich.rule import Rule
+
+from src.config import get_settings
 
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
 COLLECTION = "generation_walkthrough"
-EMBED_MODEL = "voyage-3"
-DIM = 1024
-CLAUDE_MODEL = "claude-sonnet-4-6"
+settings = get_settings()
 
-if not os.getenv("VOYAGE_API_KEY"):
-    raise SystemExit("Set VOYAGE_API_KEY first.")
-if not os.getenv("ANTHROPIC_API_KEY"):
-    raise SystemExit("Set ANTHROPIC_API_KEY first.")
-
-vo = voyageai.Client()
-qdrant = QdrantClient(url="http://localhost:6333")
-claude = Anthropic()
+embed_model = VoyageEmbedding(
+    model_name=settings.voyage_model,
+    voyage_api_key=settings.voyage_api_key,
+)
+llm = Anthropic(
+    model=settings.anthropic_model,
+    api_key=settings.anthropic_api_key,
+    max_tokens=1024,
+)
+qdrant = QdrantClient(url=settings.qdrant_url)
 
 
 DOCUMENT = textwrap.dedent("""\
@@ -82,122 +94,70 @@ DOCUMENT = textwrap.dedent("""\
 
 
 # ---------------------------------------------------------------------------
-# 0. Setup the corpus
+# 0. Build the corpus
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]0. Build the corpus (chunk → embed → index)"))
-
-splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=80)
-chunks = splitter.split_text(DOCUMENT)
-print(f"Chunked into {len(chunks)} pieces.")
+print(Rule("[bold cyan]0. Build the corpus (Document → split → embed → index)"))
 
 if COLLECTION in {c.name for c in qdrant.get_collections().collections}:
     qdrant.delete_collection(COLLECTION)
-qdrant.create_collection(
-    collection_name=COLLECTION,
-    vectors_config=VectorParams(size=DIM, distance=Distance.COSINE),
+
+vector_store = QdrantVectorStore(client=qdrant, collection_name=COLLECTION)
+splitter = SentenceSplitter(chunk_size=256, chunk_overlap=32)
+nodes = splitter.get_nodes_from_documents([Document(text=DOCUMENT, metadata={"source": "remote_work_policy.md"})])
+print(f"Split into {len(nodes)} nodes.")
+
+index = VectorStoreIndex(
+    nodes=nodes,
+    storage_context=StorageContext.from_defaults(vector_store=vector_store),
+    embed_model=embed_model,
 )
-
-embeddings = vo.embed(chunks, model=EMBED_MODEL, input_type="document").embeddings
-qdrant.upsert(
-    collection_name=COLLECTION,
-    points=[
-        PointStruct(
-            id=i,
-            vector=v,
-            payload={"text": t, "source": "remote_work_policy.md", "chunk_index": i},
-        )
-        for i, (t, v) in enumerate(zip(chunks, embeddings))
-    ],
-)
-print(f"Indexed {len(chunks)} chunks. Ready.\n")
+print("Indexed.\n")
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# 1. Naked Claude (no context)
 # ---------------------------------------------------------------------------
-def retrieve(question: str, k: int = 3) -> list[dict]:
-    qvec = vo.embed([question], model=EMBED_MODEL, input_type="query").embeddings[0]
-    hits = qdrant.query_points(
-        collection_name=COLLECTION, query=qvec, limit=k, with_payload=True
-    ).points
-    return [
-        {
-            "label": f"#{i + 1}",
-            "text": h.payload["text"],
-            "source": h.payload["source"],
-            "chunk_index": h.payload["chunk_index"],
-            "score": h.score,
-        }
-        for i, h in enumerate(hits)
-    ]
-
-
-def format_context(hits: list[dict]) -> str:
-    blocks = []
-    for h in hits:
-        blocks.append(
-            f"[{h['label']}] (source: {h['source']}, chunk: {h['chunk_index']})\n{h['text']}"
-        )
-    return "\n\n---\n\n".join(blocks)
-
-
-SYSTEM_GROUNDED = """You are a helpful research assistant.
-Answer the user's question using ONLY the provided context passages.
-Each passage is labeled like [#1], [#2], etc.
-Cite the passages you used inline using the same labels (e.g. "as shown in [#2]").
-If the context does not contain the answer, say so honestly. Do not invent facts."""
-
-SYSTEM_NAKED = "You are a helpful assistant."
-
-
-def ask_claude(system: str, user_msg: str, temperature: float = 0.0) -> str:
-    response = claude.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=1024,
-        temperature=temperature,
-        system=system,
-        messages=[{"role": "user", "content": user_msg}],
-    )
-    return "".join(block.text for block in response.content if block.type == "text")
-
-
-# ---------------------------------------------------------------------------
-# 1. NAKED Claude — no context at all
-# ---------------------------------------------------------------------------
-print(Rule("[bold cyan]1. Ask Claude WITHOUT any context (the baseline)"))
+print(Rule("[bold cyan]1. Ask Claude WITHOUT any context"))
 
 question = "What is the equipment stipend for remote workers at Acme Corp?"
 print(f"[bold]Question:[/bold] {question}\n")
 
-naked_answer = ask_claude(SYSTEM_NAKED, question)
-print(Panel(naked_answer, title="Naked Claude", border_style="yellow"))
-print(
-    "[dim]Notice: Claude has NO IDEA about Acme Corp's specific policies. It either makes "
-    "something up, gives generic info, or admits ignorance. This is what 'no RAG' looks like.[/dim]\n"
-)
+naked = llm.complete(question)
+print(Panel(naked.text, title="Naked Claude", border_style="yellow"))
+print("[dim]Claude has no idea about Acme Corp's specific policies.[/dim]\n")
 
 
 # ---------------------------------------------------------------------------
-# 2. GROUNDED Claude — with retrieved context
+# 2. Grounded via a RetrieverQueryEngine
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]2. Ask Claude WITH retrieved context (the RAG payoff)"))
+print(Rule("[bold cyan]2. Ask Claude through a RetrieverQueryEngine (RAG)"))
 
-hits = retrieve(question, k=3)
-print(f"Retrieved {len(hits)} chunks. Top scores: {[round(h['score'], 3) for h in hits]}\n")
-
-context = format_context(hits)
-user_msg = f"Context:\n{context}\n\nQuestion: {question}"
-
-print("[dim]The actual prompt being sent to Claude:[/dim]")
-print(Panel(user_msg, title="User message", border_style="blue", width=100))
-print()
-
-grounded_answer = ask_claude(SYSTEM_GROUNDED, user_msg)
-print(Panel(grounded_answer, title="Grounded Claude", border_style="green"))
-print(
-    "[dim]Notice: Claude answers with the SPECIFIC fact from the document AND cites it. "
-    "This is the entire promise of RAG — turning a generic LLM into a domain expert.[/dim]\n"
+# Customize the prompt so Claude cites passages with [#1], [#2] labels —
+# the same convention our production app uses.
+GROUNDED_TEMPLATE = PromptTemplate(
+    "You are a helpful research assistant. Answer the user's question using ONLY the context "
+    "passages below. Each passage is labeled like [#1], [#2], etc. Cite the passages you used "
+    "inline using the same labels. If the context does not contain the answer, say so honestly.\n"
+    "\nContext:\n{context_str}\n"
+    "\nQuestion: {query_str}\n"
+    "Answer: "
 )
+
+query_engine = index.as_query_engine(
+    llm=llm,
+    similarity_top_k=3,
+    response_mode=ResponseMode.COMPACT,
+    text_qa_template=GROUNDED_TEMPLATE,
+)
+
+response = query_engine.query(question)
+print(Panel(str(response), title="Grounded Claude", border_style="green"))
+
+print("\n[bold]Source nodes used:[/bold]")
+for i, sn in enumerate(response.source_nodes, start=1):
+    print(f"  [#{i}]  score={sn.score:.4f}  "
+          f"source={sn.node.metadata.get('source')}  "
+          f"text={sn.node.get_content()[:100]!r}...")
 
 
 # ---------------------------------------------------------------------------
@@ -209,75 +169,37 @@ oos_question = "What's Acme Corp's parental leave policy?"
 print(f"[bold]Question:[/bold] {oos_question}")
 print("[dim](This document doesn't say anything about parental leave.)[/dim]\n")
 
-oos_hits = retrieve(oos_question, k=3)
-print(f"Retrieved chunks anyway (top scores: {[round(h['score'], 3) for h in oos_hits]})")
-print("[dim]Note the lower scores — vector search returns SOMETHING, even when nothing fits.[/dim]\n")
+oos_response = query_engine.query(oos_question)
+print(Panel(str(oos_response), title="Grounded Claude (out-of-scope)", border_style="red"))
+print("[dim]A well-grounded RAG should say 'I don't know' rather than confabulate.[/dim]\n")
 
-oos_context = format_context(oos_hits)
-oos_user = f"Context:\n{oos_context}\n\nQuestion: {oos_question}"
-oos_answer = ask_claude(SYSTEM_GROUNDED, oos_user)
-print(Panel(oos_answer, title="Grounded Claude (out-of-scope)", border_style="red"))
-print(
-    "[dim]A well-grounded RAG should say 'I don't know' rather than confabulate. "
-    "If you see Claude make something up here, the system prompt isn't strict enough.[/dim]\n"
+
+# ---------------------------------------------------------------------------
+# 4. Streaming
+# ---------------------------------------------------------------------------
+print(Rule("[bold cyan]4. Streaming response (watch tokens arrive live)"))
+
+stream_engine = index.as_query_engine(
+    llm=llm,
+    similarity_top_k=3,
+    response_mode=ResponseMode.COMPACT,
+    text_qa_template=GROUNDED_TEMPLATE,
+    streaming=True,
 )
-
-
-# ---------------------------------------------------------------------------
-# 4. Temperature comparison
-# ---------------------------------------------------------------------------
-print(Rule("[bold cyan]4. Temperature: 0.0 vs 0.7"))
-
-temp_question = "Summarize the security requirements for remote workers."
-temp_hits = retrieve(temp_question, k=3)
-temp_user = f"Context:\n{format_context(temp_hits)}\n\nQuestion: {temp_question}"
-
-print(f"[bold]Question:[/bold] {temp_question}\n")
-
-answer_strict = ask_claude(SYSTEM_GROUNDED, temp_user, temperature=0.0)
-answer_loose = ask_claude(SYSTEM_GROUNDED, temp_user, temperature=0.7)
-
-print(Panel(answer_strict, title="temperature=0.0 (deterministic)", border_style="cyan"))
-print(Panel(answer_loose, title="temperature=0.7 (creative)", border_style="magenta"))
-print(
-    "[dim]temp=0.0 is reproducible and tightly grounded — same input, same output. "
-    "temp=0.7 has more variation and may rephrase more creatively. For RAG, lower is "
-    "usually better.[/dim]\n"
-)
-
-
-# ---------------------------------------------------------------------------
-# 5. Streaming
-# ---------------------------------------------------------------------------
-print(Rule("[bold cyan]5. Streaming response (watch tokens arrive live)"))
-
 stream_question = "What's the application process for remote work?"
-stream_hits = retrieve(stream_question, k=3)
-stream_user = f"Context:\n{format_context(stream_hits)}\n\nQuestion: {stream_question}"
-
 print(f"[bold]Question:[/bold] {stream_question}\n")
 print("[bold]Streamed answer:[/bold]")
 
-with claude.messages.stream(
-    model=CLAUDE_MODEL,
-    max_tokens=1024,
-    temperature=0.0,
-    system=SYSTEM_GROUNDED,
-    messages=[{"role": "user", "content": stream_user}],
-) as stream:
-    for delta in stream.text_stream:
-        print(delta, end="", flush=True)
+streaming_response = stream_engine.query(stream_question)
+streaming_response.print_response_stream()
 print("\n")
-
-print(
-    "[dim]Same answer as non-streaming, but tokens arrive incrementally. This is what "
-    "you'll wire into the FastAPI endpoint via Server-Sent Events for the UI.[/dim]\n"
-)
+print("[dim]Same answer as the non-streaming engine, just delivered token by token. "
+      "Plug this into FastAPI's StreamingResponse for an SSE endpoint.[/dim]\n")
 
 
 # ---------------------------------------------------------------------------
-# 6. Done
+# 5. Done
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]6. Done"))
+print(Rule("[bold cyan]5. Done"))
 print(f"Collection '{COLLECTION}' preserved at http://localhost:6333/dashboard")
-print("[bold green]✓ Walkthrough complete. You've seen end-to-end RAG.[/bold green]")
+print("[bold green]✓ Walkthrough complete. End-to-end RAG via LlamaIndex.[/bold green]")

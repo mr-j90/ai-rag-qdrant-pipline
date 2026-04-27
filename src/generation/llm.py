@@ -1,14 +1,25 @@
-"""Claude wrapper for the generation step. Builds a context-grounded prompt
-from retrieved chunks and asks Claude to answer with inline citations."""
+"""Retrieval + Claude generation, glued together with LlamaIndex.
+
+We don't use the off-the-shelf `RetrieverQueryEngine` because we want full
+control over the prompt — specifically the [#1], [#2] citation style that
+the API contract and Streamlit UI both depend on. The retriever and the LLM
+both come from LlamaIndex; only the prompt assembly is ours.
+"""
 from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from functools import lru_cache
 
-from anthropic import Anthropic
+from llama_index.core import VectorStoreIndex
+from llama_index.core.llms import ChatMessage, MessageRole
+from llama_index.core.schema import NodeWithScore
+from llama_index.core.vector_stores import MetadataFilter, MetadataFilters
+from llama_index.llms.anthropic import Anthropic
 
 from src.config import get_settings
-from src.retrieval.store import SearchResult
+from src.retrieval.embeddings import get_embed_model
+from src.retrieval.store import get_vector_store
 
 
 SYSTEM_PROMPT = """You are a helpful research assistant.
@@ -24,56 +35,93 @@ class GenerationResult:
     sources: list[dict]
 
 
-def _build_context(results: list[SearchResult]) -> str:
+@lru_cache
+def get_llm() -> Anthropic:
+    s = get_settings()
+    return Anthropic(model=s.anthropic_model, api_key=s.anthropic_api_key, max_tokens=1024)
+
+
+def _retriever(top_k: int, source_filter: str | None):
+    index = VectorStoreIndex.from_vector_store(
+        vector_store=get_vector_store(),
+        embed_model=get_embed_model(),
+    )
+    filters = None
+    if source_filter:
+        filters = MetadataFilters(
+            filters=[MetadataFilter(key="file_name", value=source_filter)]
+        )
+    return index.as_retriever(similarity_top_k=top_k, filters=filters)
+
+
+def retrieve(question: str, top_k: int, source_filter: str | None = None) -> list[NodeWithScore]:
+    return _retriever(top_k, source_filter).retrieve(question)
+
+
+def _build_context(nodes: list[NodeWithScore]) -> str:
     lines = []
-    for i, r in enumerate(results, start=1):
-        src = r.metadata.get("source", "unknown")
-        page = r.metadata.get("page", "?")
-        lines.append(f"[#{i}] (source: {src}, page: {page})\n{r.text}")
+    for i, n in enumerate(nodes, start=1):
+        meta = n.node.metadata or {}
+        src = meta.get("file_name", "unknown")
+        page = meta.get("page_label", "?")
+        lines.append(f"[#{i}] (source: {src}, page: {page})\n{n.node.get_content()}")
     return "\n\n---\n\n".join(lines)
 
 
-def _sources_payload(results: list[SearchResult]) -> list[dict]:
+def _sources_payload(nodes: list[NodeWithScore]) -> list[dict]:
+    out = []
+    for i, n in enumerate(nodes, start=1):
+        meta = n.node.metadata or {}
+        out.append(
+            {
+                "label": f"#{i}",
+                "source": meta.get("file_name"),
+                "page": meta.get("page_label"),
+                "score": round(n.score or 0.0, 4),
+                "preview": n.node.get_content()[:200],
+            }
+        )
+    return out
+
+
+def _messages(question: str, nodes: list[NodeWithScore]) -> list[ChatMessage]:
+    user = f"Context:\n{_build_context(nodes)}\n\nQuestion: {question}"
     return [
-        {
-            "label": f"#{i}",
-            "source": r.metadata.get("source"),
-            "page": r.metadata.get("page"),
-            "score": round(r.score, 4),
-            "preview": r.text[:200],
-        }
-        for i, r in enumerate(results, start=1)
+        ChatMessage(role=MessageRole.SYSTEM, content=SYSTEM_PROMPT),
+        ChatMessage(role=MessageRole.USER, content=user),
     ]
 
 
-class ClaudeGenerator:
-    def __init__(self) -> None:
-        settings = get_settings()
-        self.client = Anthropic(api_key=settings.anthropic_api_key)
-        self.model = settings.anthropic_model
+def answer(
+    question: str, top_k: int, source_filter: str | None = None
+) -> tuple[GenerationResult, list[NodeWithScore]]:
+    """Retrieve + generate. Returns the answer payload AND the raw nodes
+    so callers can detect "no hits" without re-retrieving."""
+    nodes = retrieve(question, top_k, source_filter)
+    if not nodes:
+        return GenerationResult(answer="", sources=[]), nodes
 
-    def answer(self, question: str, results: list[SearchResult]) -> GenerationResult:
-        context = _build_context(results)
-        user_msg = f"Context:\n{context}\n\nQuestion: {question}"
+    response = get_llm().chat(_messages(question, nodes))
+    return (
+        GenerationResult(answer=response.message.content or "", sources=_sources_payload(nodes)),
+        nodes,
+    )
 
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        text = "".join(block.text for block in response.content if block.type == "text")
-        return GenerationResult(answer=text, sources=_sources_payload(results))
 
-    def stream_answer(self, question: str, results: list[SearchResult]) -> Iterator[str]:
-        context = _build_context(results)
-        user_msg = f"Context:\n{context}\n\nQuestion: {question}"
+def stream_answer(
+    question: str, top_k: int, source_filter: str | None = None
+) -> tuple[Iterator[str], list[dict]]:
+    """Retrieve + stream. Returns (token_iterator, sources_payload).
+    Sources are returned eagerly so SSE callers can emit them before the first token."""
+    nodes = retrieve(question, top_k, source_filter)
+    if not nodes:
+        return iter(()), []
 
-        with self.client.messages.stream(
-            model=self.model,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_msg}],
-        ) as stream:
-            for delta in stream.text_stream:
-                yield delta
+    stream = get_llm().stream_chat(_messages(question, nodes))
+
+    def deltas() -> Iterator[str]:
+        for chunk in stream:
+            if chunk.delta:
+                yield chunk.delta
+
+    return deltas(), _sources_payload(nodes)

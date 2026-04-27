@@ -1,47 +1,51 @@
-"""Orchestrate load -> chunk -> embed -> upsert."""
+"""LlamaIndex ingestion: load PDFs -> split -> embed -> upsert into Qdrant.
+
+`IngestionPipeline` runs the transformations sequentially, threading metadata
+(file_name, page_label) through from the reader down to each chunk node.
+"""
 from __future__ import annotations
 
 from pathlib import Path
 
-from src.ingest.chunker import chunk_pages
-from src.ingest.loaders import load_pdf, load_pdfs_from_dir
-from src.retrieval.embeddings import VoyageEmbedder
-from src.retrieval.store import QdrantStore
+from llama_index.core import SimpleDirectoryReader
+from llama_index.core.ingestion import IngestionPipeline
+from llama_index.core.node_parser import SentenceSplitter
+
+from src.config import get_settings
+from src.retrieval.embeddings import get_embed_model
+from src.retrieval.store import get_vector_store
 
 
-def _embed_in_batches(
-    embedder: VoyageEmbedder, texts: list[str], batch_size: int = 64
-) -> list[list[float]]:
-    """Voyage has per-request token limits; batching keeps us safe and parallelizable later."""
-    all_vectors: list[list[float]] = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-        all_vectors.extend(embedder.embed_documents(batch))
-    return all_vectors
+def _load_documents(path: Path) -> list:
+    """Load PDFs into LlamaIndex Documents — one per page (PDFReader default)."""
+    if path.is_dir():
+        reader = SimpleDirectoryReader(input_dir=str(path), required_exts=[".pdf"])
+    elif path.suffix.lower() == ".pdf":
+        reader = SimpleDirectoryReader(input_files=[str(path)])
+    else:
+        raise ValueError(f"Unsupported path: {path}")
+    return reader.load_data()
 
 
 def ingest_path(path: str | Path) -> dict:
     """Ingest a single PDF or a directory of PDFs."""
     p = Path(path)
-    if p.is_dir():
-        pages = load_pdfs_from_dir(p)
-    elif p.suffix.lower() == ".pdf":
-        pages = load_pdf(p)
-    else:
-        raise ValueError(f"Unsupported path: {p}")
-
-    if not pages:
+    docs = _load_documents(p)
+    if not docs:
         return {"pages": 0, "chunks": 0, "ids": []}
 
-    chunks = chunk_pages(pages)
-    texts = [c.text for c in chunks]
-    metadatas = [c.metadata for c in chunks]
+    s = get_settings()
+    pipeline = IngestionPipeline(
+        transformations=[
+            SentenceSplitter(chunk_size=s.chunk_size, chunk_overlap=s.chunk_overlap),
+            get_embed_model(),
+        ],
+        vector_store=get_vector_store(),
+    )
+    nodes = pipeline.run(documents=docs, show_progress=False)
 
-    embedder = VoyageEmbedder()
-    vectors = _embed_in_batches(embedder, texts)
-
-    store = QdrantStore()
-    store.ensure_collection()
-    ids = store.upsert(texts=texts, embeddings=vectors, metadatas=metadatas)
-
-    return {"pages": len(pages), "chunks": len(chunks), "ids": ids}
+    return {
+        "pages": len(docs),
+        "chunks": len(nodes),
+        "ids": [n.node_id for n in nodes],
+    }

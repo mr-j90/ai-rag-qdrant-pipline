@@ -1,46 +1,54 @@
 """
-Chunking walkthrough — see what good and bad chunking actually look like.
+LlamaIndex chunking walkthrough — node parsers, side by side.
 
-We'll take one document and chunk it three different ways:
-    1. Naive fixed-size split (no overlap, ignores boundaries)
-    2. RecursiveCharacterTextSplitter, no overlap
-    3. RecursiveCharacterTextSplitter, with overlap (production pattern)
+LlamaIndex calls chunkers "node parsers." They all take Documents and emit
+a list of Nodes (text + metadata). The interesting ones for prose:
 
-Then we'll embed all three versions, put them in three Qdrant collections,
-and run the same query against each. You'll see retrieval quality change.
+    - TokenTextSplitter         — fixed token windows, ignores boundaries
+    - SentenceSplitter          — respects sentence + paragraph boundaries
+                                  (this is what `IngestionPipeline` uses by default
+                                  in our project, configured by chunk_size/overlap)
+    - SemanticSplitterNodeParser — splits where embedding similarity drops
+
+This walkthrough takes one document, runs each parser on it, indexes each
+variant into its own Qdrant collection, and runs the same query against
+each. You can see retrieval quality change.
 
 Prereqs:
-    - docker compose up -d  (Qdrant running)
-    - VOYAGE_API_KEY in environment
+    - docker compose up -d
+    - VOYAGE_API_KEY in .env
 
 Run:
     uv run python -m scripts.learn.chunking_walkthrough
 """
 from __future__ import annotations
 
-import os
 import textwrap
 
-import voyageai
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from llama_index.core import Document, StorageContext, VectorStoreIndex
+from llama_index.core.node_parser import (
+    SemanticSplitterNodeParser,
+    SentenceSplitter,
+    TokenTextSplitter,
+)
+from llama_index.embeddings.voyageai import VoyageEmbedding
+from llama_index.vector_stores.qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
 from rich import print
 from rich.rule import Rule
 from rich.table import Table
 
+from src.config import get_settings
+
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
-MODEL = "voyage-3"
-DIM = 1024
-
-api_key = os.getenv("VOYAGE_API_KEY")
-if not api_key:
-    raise SystemExit("Set VOYAGE_API_KEY first.")
-
-vo = voyageai.Client(api_key=api_key)
-qdrant = QdrantClient(url="http://localhost:6333")
+settings = get_settings()
+embed_model = VoyageEmbedding(
+    model_name=settings.voyage_model,
+    voyage_api_key=settings.voyage_api_key,
+)
+qdrant = QdrantClient(url=settings.qdrant_url)
 
 
 DOCUMENT = textwrap.dedent("""\
@@ -85,116 +93,102 @@ DOCUMENT = textwrap.dedent("""\
     arrangements.
 """)
 
+source_doc = Document(text=DOCUMENT, metadata={"source": "remote_work_policy.md"})
+
+
 # ---------------------------------------------------------------------------
-# 1. Naive chunking — what NOT to do
+# 1. TokenTextSplitter — the closest thing to "naive fixed window"
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]1. Naive fixed-size chunking (the baseline)"))
+print(Rule("[bold cyan]1. TokenTextSplitter (fixed token windows, no overlap)"))
+
+token_splitter = TokenTextSplitter(chunk_size=128, chunk_overlap=0)
+token_nodes = token_splitter.get_nodes_from_documents([source_doc])
+print(f"Got {len(token_nodes)} nodes.\n")
+for i, n in enumerate(token_nodes):
+    text = n.get_content()
+    print(f"[bold]Node {i}[/bold] ({len(text)} chars):")
+    print(f"  start: ...{text[:60]!r}")
+    print(f"  end:   ...{text[-60:]!r}\n")
+print("[dim]Token windows ignore section headers and sentence boundaries.[/dim]")
 
 
-def naive_chunk(text: str, size: int = 400) -> list[str]:
-    """Slice every `size` characters. No overlap, no boundary respect."""
-    return [text[i : i + size] for i in range(0, len(text), size)]
+# ---------------------------------------------------------------------------
+# 2. SentenceSplitter, no overlap
+# ---------------------------------------------------------------------------
+print(Rule("[bold cyan]2. SentenceSplitter, no overlap"))
+
+sentence_no_overlap = SentenceSplitter(chunk_size=128, chunk_overlap=0)
+no_overlap_nodes = sentence_no_overlap.get_nodes_from_documents([source_doc])
+print(f"Got {len(no_overlap_nodes)} nodes.\n")
+for i, n in enumerate(no_overlap_nodes):
+    text = n.get_content()
+    print(f"[bold]Node {i}[/bold] ({len(text)} chars):")
+    print(f"  start: {text[:60]!r}...")
+    print(f"  end:   ...{text[-60:]!r}\n")
+print("[dim]Better — sentences and paragraphs stay intact. But chunk seams are still hard cuts.[/dim]")
 
 
-naive_chunks = naive_chunk(DOCUMENT, size=400)
-print(f"Got {len(naive_chunks)} chunks of ~400 chars each.\n")
+# ---------------------------------------------------------------------------
+# 3. SentenceSplitter WITH overlap — the production default
+# ---------------------------------------------------------------------------
+print(Rule("[bold cyan]3. SentenceSplitter WITH overlap (production default)"))
 
-for i, c in enumerate(naive_chunks):
-    print(f"[bold]Chunk {i}[/bold] ({len(c)} chars):")
-    print(f"  start: ...{c[:60]!r}")
-    print(f"  end:   ...{c[-60:]!r}\n")
+sentence_overlap = SentenceSplitter(chunk_size=128, chunk_overlap=24)
+overlap_nodes = sentence_overlap.get_nodes_from_documents([source_doc])
+print(f"Got {len(overlap_nodes)} nodes.\n")
+for i in range(len(overlap_nodes) - 1):
+    end = overlap_nodes[i].get_content()[-60:]
+    start = overlap_nodes[i + 1].get_content()[:60]
+    print(f"[bold]Node {i} → {i + 1} boundary[/bold]")
+    print(f"  end of {i}:    ...{end!r}")
+    print(f"  start of {i + 1}:  {start!r}...\n")
+print("[dim]Deliberate duplication at boundaries: a fact near the seam appears in both nodes, "
+      "so retrieval can't lose it.[/dim]")
 
-print(
-    "[dim]Notice: chunks start and end mid-word, mid-sentence, sometimes mid-section-header. "
-    "Embeddings of these will be lower quality because the model sees broken context.[/dim]"
+
+# ---------------------------------------------------------------------------
+# 4. SemanticSplitterNodeParser — split where meaning shifts
+# ---------------------------------------------------------------------------
+print(Rule("[bold cyan]4. SemanticSplitterNodeParser (embedding-aware boundaries)"))
+
+semantic_splitter = SemanticSplitterNodeParser(
+    embed_model=embed_model,
+    breakpoint_percentile_threshold=95,
+    buffer_size=1,
 )
+semantic_nodes = semantic_splitter.get_nodes_from_documents([source_doc])
+print(f"Got {len(semantic_nodes)} nodes.\n")
+for i, n in enumerate(semantic_nodes):
+    text = n.get_content()
+    snippet = text[:120].replace("\n", " ")
+    print(f"[bold]Node {i}[/bold] ({len(text)} chars): {snippet}...")
+print("\n[dim]Splits happen where consecutive sentences become semantically dissimilar — "
+      "tends to align with section boundaries when the doc is well-structured.[/dim]")
 
 
 # ---------------------------------------------------------------------------
-# 2. Recursive splitter, NO overlap
+# 5. Index each variant and compare retrieval
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]2. RecursiveCharacterTextSplitter, no overlap"))
-
-no_overlap = RecursiveCharacterTextSplitter(
-    chunk_size=400,
-    chunk_overlap=0,
-    separators=["\n\n", "\n", ". ", " ", ""],
-)
-recursive_chunks = no_overlap.split_text(DOCUMENT)
-print(f"Got {len(recursive_chunks)} chunks. Sizes: {[len(c) for c in recursive_chunks]}\n")
-
-for i, c in enumerate(recursive_chunks):
-    print(f"[bold]Chunk {i}[/bold] ({len(c)} chars):")
-    print(f"  start: {c[:60]!r}...")
-    print(f"  end:   ...{c[-60:]!r}\n")
-
-print(
-    "[dim]Better: chunks now break on paragraph and sentence boundaries. But the boundary "
-    "between chunks is still a hard cut — info near the seam can be orphaned.[/dim]"
-)
+print(Rule("[bold cyan]5. Compare retrieval across strategies"))
 
 
-# ---------------------------------------------------------------------------
-# 3. Recursive splitter, WITH overlap (the production pattern)
-# ---------------------------------------------------------------------------
-print(Rule("[bold cyan]3. RecursiveCharacterTextSplitter, with overlap"))
-
-with_overlap = RecursiveCharacterTextSplitter(
-    chunk_size=400,
-    chunk_overlap=80,
-    separators=["\n\n", "\n", ". ", " ", ""],
-)
-overlap_chunks = with_overlap.split_text(DOCUMENT)
-print(f"Got {len(overlap_chunks)} chunks. Sizes: {[len(c) for c in overlap_chunks]}\n")
-
-for i in range(len(overlap_chunks) - 1):
-    end_of_current = overlap_chunks[i][-60:]
-    start_of_next = overlap_chunks[i + 1][:60]
-    print(f"[bold]Chunk {i} → Chunk {i + 1} boundary[/bold]")
-    print(f"  end of {i}:    ...{end_of_current!r}")
-    print(f"  start of {i + 1}:  {start_of_next!r}...")
-    print()
-
-print(
-    "[dim]Now there's deliberate duplication at boundaries. A key sentence near a seam "
-    "appears in BOTH chunks — so retrieval can't lose it.[/dim]"
-)
-
-
-# ---------------------------------------------------------------------------
-# 4. Index all three versions and compare retrieval
-# ---------------------------------------------------------------------------
-print(Rule("[bold cyan]4. Compare retrieval quality across chunking strategies"))
-
-
-def index_chunks(name: str, chunks: list[str]) -> str:
-    """Create a fresh collection, embed chunks, upsert. Returns collection name."""
+def index_nodes(name: str, nodes: list) -> VectorStoreIndex:
     coll = f"chunking_{name}"
     if coll in {c.name for c in qdrant.get_collections().collections}:
         qdrant.delete_collection(coll)
-    qdrant.create_collection(
-        collection_name=coll,
-        vectors_config=VectorParams(size=DIM, distance=Distance.COSINE),
+    vs = QdrantVectorStore(client=qdrant, collection_name=coll)
+    return VectorStoreIndex(
+        nodes=nodes,
+        storage_context=StorageContext.from_defaults(vector_store=vs),
+        embed_model=embed_model,
     )
-    embeddings = vo.embed(chunks, model=MODEL, input_type="document").embeddings
-    qdrant.upsert(
-        collection_name=coll,
-        points=[
-            PointStruct(
-                id=i,
-                vector=v,
-                payload={"text": t, "chunk_index": i},
-            )
-            for i, (t, v) in enumerate(zip(chunks, embeddings))
-        ],
-    )
-    return coll
 
 
-print("Indexing all three variants...")
-coll_naive = index_chunks("naive", naive_chunks)
-coll_recursive = index_chunks("recursive_no_overlap", recursive_chunks)
-coll_overlap = index_chunks("recursive_with_overlap", overlap_chunks)
+print("Indexing all four variants...")
+idx_token = index_nodes("token", token_nodes)
+idx_no_overlap = index_nodes("sentence_no_overlap", no_overlap_nodes)
+idx_overlap = index_nodes("sentence_with_overlap", overlap_nodes)
+idx_semantic = index_nodes("semantic", semantic_nodes)
 print("  ✓ Indexed.\n")
 
 queries = [
@@ -204,47 +198,40 @@ queries = [
     "Who is eligible for remote work?",
 ]
 
-
-def search(coll: str, query: str, k: int = 1) -> tuple[float, str]:
-    qvec = vo.embed([query], model=MODEL, input_type="query").embeddings[0]
-    hits = qdrant.query_points(
-        collection_name=coll, query=qvec, limit=k, with_payload=True
-    ).points
-    if not hits:
-        return (0.0, "")
-    return (hits[0].score, hits[0].payload["text"])
-
-
 for q in queries:
     print(f"[bold]Q:[/bold] {q}\n")
-
     table = Table(show_lines=True)
     table.add_column("Strategy", style="bold")
     table.add_column("Score", justify="right")
     table.add_column("Top retrieved chunk (truncated)", overflow="fold", max_width=70)
 
-    for label, coll in [
-        ("Naive", coll_naive),
-        ("Recursive (no overlap)", coll_recursive),
-        ("Recursive (with overlap)", coll_overlap),
+    for label, idx in [
+        ("Token", idx_token),
+        ("Sentence (no overlap)", idx_no_overlap),
+        ("Sentence (with overlap)", idx_overlap),
+        ("Semantic", idx_semantic),
     ]:
-        score, text = search(coll, q)
+        hits = idx.as_retriever(similarity_top_k=1).retrieve(q)
+        if not hits:
+            table.add_row(label, "-", "(no hits)")
+            continue
+        text = hits[0].node.get_content()
         snippet = text[:200].replace("\n", " ")
         if len(text) > 200:
             snippet += "..."
-        table.add_row(label, f"{score:.4f}", snippet)
-
+        table.add_row(label, f"{hits[0].score:.4f}", snippet)
     print(table)
     print()
 
 
 # ---------------------------------------------------------------------------
-# 5. Done
+# 6. Done
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]5. Done"))
-print("Three collections preserved for inspection:")
-print("  - chunking_naive")
-print("  - chunking_recursive_no_overlap")
-print("  - chunking_recursive_with_overlap")
-print("Visit http://localhost:6333/dashboard to compare them visually.")
+print(Rule("[bold cyan]6. Done"))
+print("Collections preserved:")
+print("  - chunking_token")
+print("  - chunking_sentence_no_overlap")
+print("  - chunking_sentence_with_overlap")
+print("  - chunking_semantic")
+print("Compare them at http://localhost:6333/dashboard.")
 print("[bold green]✓ Walkthrough complete.[/bold green]")

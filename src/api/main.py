@@ -7,10 +7,9 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from src.config import get_settings
-from src.generation.llm import ClaudeGenerator
+from src.generation.llm import answer as generate_answer
 from src.ingest.pipeline import ingest_path
-from src.retrieval.embeddings import VoyageEmbedder
-from src.retrieval.store import QdrantStore
+from src.retrieval import store
 
 app = FastAPI(title="RAG-Qdrant", version="0.1.0")
 
@@ -43,20 +42,17 @@ def health() -> dict:
 
 @app.get("/stats")
 def stats() -> dict:
-    store = QdrantStore()
-    store.ensure_collection()
+    s = get_settings()
     return {
-        "collection": store.collection,
+        "collection": s.qdrant_collection,
         "vector_count": store.count(),
-        "dim": store.dim,
+        "dim": s.embedding_dim,
     }
 
 
 @app.get("/sources")
 def sources() -> dict:
     """Distinct source filenames currently indexed. Powers the UI filter dropdown."""
-    store = QdrantStore()
-    store.ensure_collection()
     return {"sources": store.list_sources()}
 
 
@@ -85,22 +81,14 @@ def query(req: QueryRequest) -> QueryResponse:
     settings = get_settings()
     top_k = req.top_k or settings.top_k
 
-    store = QdrantStore()
-    store.ensure_collection()
-
     if store.count() == 0:
         raise HTTPException(
             status_code=400,
             detail="Collection is empty. Ingest some PDFs first via scripts/ingest_cli.py.",
         )
 
-    embedder = VoyageEmbedder()
-    qvec = embedder.embed_query(req.question)
-    results = store.search(query_vector=qvec, top_k=top_k, source_filter=req.source_filter)
-
-    if not results:
+    result, nodes = generate_answer(req.question, top_k=top_k, source_filter=req.source_filter)
+    if not nodes:
         raise HTTPException(status_code=404, detail="No matching documents found.")
 
-    generator = ClaudeGenerator()
-    out = generator.answer(req.question, results)
-    return QueryResponse(answer=out.answer, sources=out.sources)
+    return QueryResponse(answer=result.answer, sources=result.sources)

@@ -1,207 +1,157 @@
 """
-Qdrant walkthrough — learn the vector DB in isolation.
+LlamaIndex × Qdrant walkthrough — learn the storage layer in isolation.
 
-This script uses FAKE (random) vectors so you can focus on Qdrant's mechanics
-without worrying about embeddings yet. We'll run the same sequence of operations
-you'd do in a real RAG pipeline:
+LlamaIndex hides a lot of Qdrant. That's the whole point of using it. But it's
+still useful to see what's happening underneath, so this script walks through:
 
-    1. Connect to Qdrant
-    2. Create a collection
-    3. Insert ("upsert") points
-    4. Inspect what's stored
-    5. Run a vector search
-    6. Run a FILTERED vector search
-    7. Add a payload index
-    8. Clean up
+    1. Create a QdrantVectorStore (LlamaIndex's wrapper)
+    2. Build a VectorStoreIndex from a few Documents
+    3. Inspect what actually got stored in Qdrant under the hood
+    4. Run a retrieval through the index
+    5. Run a metadata-FILTERED retrieval (the killer feature)
+    6. Drop down to the raw QdrantClient for admin operations
+    7. Clean up
 
-Run it section by section. Each block prints what just happened.
+The lesson: LlamaIndex's index is the *front door*; QdrantClient is the
+*service entrance*. Use the front door for reads/writes, the service
+entrance for admin (count, reset, list distinct payload values).
 
 Prereq:  docker compose up -d
 Run:     uv run python -m scripts.learn.qdrant_walkthrough
 """
 from __future__ import annotations
 
-import random
+from llama_index.core import (
+    Document,
+    StorageContext,
+    VectorStoreIndex,
+)
+from llama_index.core.vector_stores import MetadataFilter, MetadataFilters
+from llama_index.embeddings.voyageai import VoyageEmbedding
+from llama_index.vector_stores.qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
 from rich import print
 from rich.rule import Rule
 
-from qdrant_client import QdrantClient
-from qdrant_client.models import (
-    Distance,
-    FieldCondition,
-    Filter,
-    MatchValue,
-    PayloadSchemaType,
-    PointStruct,
-    Range,
-    VectorParams,
-)
+from src.config import get_settings
 
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
 COLLECTION = "qdrant_walkthrough"
-DIM = 8  # tiny dimension so we can actually print vectors and read them
-random.seed(42)
+settings = get_settings()
 
-
-def random_vector() -> list[float]:
-    """Pretend this is what an embedding model returns."""
-    return [round(random.uniform(-1, 1), 3) for _ in range(DIM)]
-
-
-client = QdrantClient(url="http://localhost:6333")
+qdrant = QdrantClient(url=settings.qdrant_url)
+embed_model = VoyageEmbedding(
+    model_name=settings.voyage_model,
+    voyage_api_key=settings.voyage_api_key,
+)
 
 
 # ---------------------------------------------------------------------------
-# 1. Connect & inspect what's already there
+# 1. Create the LlamaIndex-flavored vector store
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]1. Connect & inspect"))
-existing = [c.name for c in client.get_collections().collections]
-print(f"Existing collections: {existing}")
+print(Rule("[bold cyan]1. QdrantVectorStore — LlamaIndex's adapter"))
 
-# Clean slate for this walkthrough
-if COLLECTION in existing:
-    client.delete_collection(COLLECTION)
+if COLLECTION in {c.name for c in qdrant.get_collections().collections}:
+    qdrant.delete_collection(COLLECTION)
     print(f"Deleted old '{COLLECTION}' collection.")
 
-
-# ---------------------------------------------------------------------------
-# 2. Create a collection
-# ---------------------------------------------------------------------------
-print(Rule("[bold cyan]2. Create collection"))
-client.create_collection(
-    collection_name=COLLECTION,
-    vectors_config=VectorParams(size=DIM, distance=Distance.COSINE),
-)
-info = client.get_collection(COLLECTION)
-print(f"Created '{COLLECTION}'")
-print(f"  vector size:  {info.config.params.vectors.size}")
-print(f"  distance:     {info.config.params.vectors.distance}")
-print(f"  point count:  {info.points_count}")
+vector_store = QdrantVectorStore(client=qdrant, collection_name=COLLECTION)
+print(f"Created QdrantVectorStore for collection '{COLLECTION}'.")
+print("[dim]Note: the Qdrant collection itself is created lazily on the first write.[/dim]")
 
 
 # ---------------------------------------------------------------------------
-# 3. Upsert some points
+# 2. Build a VectorStoreIndex from Documents
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]3. Upsert points"))
+print(Rule("[bold cyan]2. Index a few Documents"))
+
 docs = [
-    {"id": 1, "text": "Qdrant is a vector database written in Rust.",      "source": "wiki.pdf",     "page": 1, "topic": "infra"},
-    {"id": 2, "text": "FastAPI is a Python web framework.",                 "source": "fastapi.pdf",  "page": 1, "topic": "web"},
-    {"id": 3, "text": "Voyage AI provides text embeddings.",                "source": "voyage.pdf",   "page": 3, "topic": "ml"},
-    {"id": 4, "text": "Claude is Anthropic's family of LLMs.",              "source": "anthropic.pdf","page": 2, "topic": "ml"},
-    {"id": 5, "text": "RAG combines retrieval with generation.",            "source": "rag.pdf",      "page": 1, "topic": "ml"},
-    {"id": 6, "text": "Cosine similarity measures angle between vectors.",  "source": "math.pdf",     "page": 7, "topic": "math"},
+    Document(text="Qdrant is a vector database written in Rust.",
+             metadata={"source": "wiki.pdf", "page": 1, "topic": "infra"}),
+    Document(text="FastAPI is a Python web framework.",
+             metadata={"source": "fastapi.pdf", "page": 1, "topic": "web"}),
+    Document(text="Voyage AI provides text embeddings.",
+             metadata={"source": "voyage.pdf", "page": 3, "topic": "ml"}),
+    Document(text="Claude is Anthropic's family of LLMs.",
+             metadata={"source": "anthropic.pdf", "page": 2, "topic": "ml"}),
+    Document(text="RAG combines retrieval with generation.",
+             metadata={"source": "rag.pdf", "page": 1, "topic": "ml"}),
+    Document(text="Cosine similarity measures angle between vectors.",
+             metadata={"source": "math.pdf", "page": 7, "topic": "math"}),
 ]
 
-points = [
-    PointStruct(
-        id=d["id"],
-        vector=random_vector(),
-        payload={k: v for k, v in d.items() if k != "id"},
-    )
-    for d in docs
-]
-
-client.upsert(collection_name=COLLECTION, points=points)
-print(f"Upserted {len(points)} points.")
-print(f"Collection count now: {client.count(COLLECTION, exact=True).count}")
-
-
-# ---------------------------------------------------------------------------
-# 4. Inspect what's stored
-# ---------------------------------------------------------------------------
-print(Rule("[bold cyan]4. Inspect stored points"))
-fetched = client.retrieve(
-    collection_name=COLLECTION,
-    ids=[1, 3, 5],
-    with_payload=True,
-    with_vectors=True,
+storage_context = StorageContext.from_defaults(vector_store=vector_store)
+index = VectorStoreIndex.from_documents(
+    docs,
+    storage_context=storage_context,
+    embed_model=embed_model,
 )
-for p in fetched:
-    print(f"  id={p.id}")
-    print(f"    payload: {p.payload}")
-    print(f"    vector:  {p.vector[:4]}... (truncated)")
+print(f"Indexed {len(docs)} documents. Collection count: "
+      f"{qdrant.count(COLLECTION, exact=True).count}")
 
 
 # ---------------------------------------------------------------------------
-# 5. Vector search (no filter)
+# 3. Peek under the hood — what did LlamaIndex actually write?
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]5. Vector search"))
-query_vec = random_vector()
-print(f"Query vector: {query_vec}")
+print(Rule("[bold cyan]3. What got stored?"))
 
-hits = client.query_points(
-    collection_name=COLLECTION,
-    query=query_vec,
-    limit=3,
-    with_payload=True,
-).points
+raw_points, _ = qdrant.scroll(
+    collection_name=COLLECTION, limit=2, with_payload=True, with_vectors=False
+)
+for p in raw_points:
+    print(f"  point id: {p.id}")
+    # LlamaIndex stores text under `_node_content` and metadata under `metadata`.
+    keys = sorted((p.payload or {}).keys())
+    print(f"  payload keys: {keys}")
+    md = (p.payload or {}).get("metadata") or {}
+    print(f"  metadata: {md}")
 
-print(f"\nTop {len(hits)} results:")
+
+# ---------------------------------------------------------------------------
+# 4. Retrieval through the index (the front door)
+# ---------------------------------------------------------------------------
+print(Rule("[bold cyan]4. Retrieve through the index"))
+
+retriever = index.as_retriever(similarity_top_k=3)
+hits = retriever.retrieve("What's a good database for embeddings?")
 for h in hits:
-    print(f"  score={h.score:+.4f}  id={h.id}  text='{h.payload['text']}'")
+    print(f"  score={h.score:+.4f}  topic={h.node.metadata.get('topic')}  "
+          f"text='{h.node.get_content()}'")
 
 
 # ---------------------------------------------------------------------------
-# 6. Filtered search — the killer feature
+# 5. Metadata-filtered retrieval — the killer feature
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]6. Filtered vector search"))
-ml_only = Filter(must=[FieldCondition(key="topic", match=MatchValue(value="ml"))])
+print(Rule("[bold cyan]5. Filtered retrieval"))
 
-hits = client.query_points(
-    collection_name=COLLECTION,
-    query=query_vec,
-    query_filter=ml_only,
-    limit=3,
-    with_payload=True,
-).points
-
+ml_only = MetadataFilters(filters=[MetadataFilter(key="topic", value="ml")])
+filtered = index.as_retriever(similarity_top_k=3, filters=ml_only).retrieve(
+    "Tell me about machine learning"
+)
 print("Filter: topic == 'ml'")
-for h in hits:
-    print(f"  score={h.score:+.4f}  id={h.id}  topic={h.payload['topic']}  text='{h.payload['text']}'")
-
-print("\nFilter: topic == 'ml' AND page <= 2")
-complex_filter = Filter(
-    must=[
-        FieldCondition(key="topic", match=MatchValue(value="ml")),
-        FieldCondition(key="page", range=Range(lte=2)),
-    ]
-)
-hits = client.query_points(
-    collection_name=COLLECTION,
-    query=query_vec,
-    query_filter=complex_filter,
-    limit=3,
-    with_payload=True,
-).points
-for h in hits:
-    print(f"  score={h.score:+.4f}  id={h.id}  page={h.payload['page']}  text='{h.payload['text']}'")
+for h in filtered:
+    print(f"  score={h.score:+.4f}  topic={h.node.metadata.get('topic')}  "
+          f"text='{h.node.get_content()}'")
 
 
 # ---------------------------------------------------------------------------
-# 7. Payload index — speeds up filters at scale
+# 6. Service entrance — raw QdrantClient for admin
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]7. Create a payload index"))
-client.create_payload_index(
-    collection_name=COLLECTION,
-    field_name="topic",
-    field_schema=PayloadSchemaType.KEYWORD,
-)
-client.create_payload_index(
-    collection_name=COLLECTION,
-    field_name="page",
-    field_schema=PayloadSchemaType.INTEGER,
-)
-print("Indexed 'topic' (keyword) and 'page' (integer).")
+print(Rule("[bold cyan]6. Raw QdrantClient for admin operations"))
 
-info = client.get_collection(COLLECTION)
-print(f"Payload schema now: {info.payload_schema}")
+# LlamaIndex doesn't expose collection count, payload listing, etc.
+# That's fine — drop down to qdrant_client when you need it.
+print(f"Collection count: {qdrant.count(COLLECTION, exact=True).count}")
+info = qdrant.get_collection(COLLECTION)
+print(f"Vector size: {info.config.params.vectors.size}")
+print(f"Distance:    {info.config.params.vectors.distance}")
 
 
 # ---------------------------------------------------------------------------
-# 8. Cleanup
+# 7. Cleanup
 # ---------------------------------------------------------------------------
-print(Rule("[bold cyan]8. Cleanup"))
-print(f"Collection '{COLLECTION}' kept around. Visit http://localhost:6333/dashboard to explore.")
+print(Rule("[bold cyan]7. Cleanup"))
+print(f"Collection '{COLLECTION}' kept around. http://localhost:6333/dashboard to explore.")
 print("[bold green]✓ Walkthrough complete.[/bold green]")

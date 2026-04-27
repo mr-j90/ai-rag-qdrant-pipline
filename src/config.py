@@ -22,9 +22,9 @@ class Settings(BaseSettings):
     # Generation
     anthropic_model: str = "claude-sonnet-4-6"
 
-    # Chunking & retrieval
-    chunk_size: int = 800
-    chunk_overlap: int = 120
+    # Chunking & retrieval — sizes are in TOKENS (LlamaIndex SentenceSplitter default tokenizer).
+    chunk_size: int = 512
+    chunk_overlap: int = 64
     top_k: int = 5
 
     # API

@@ -1,12 +1,15 @@
-# RAG · Qdrant + Voyage + Claude
+# RAG · LlamaIndex + Qdrant + Voyage + Claude
 
 End-to-end local RAG: ingest PDFs → Qdrant → query via FastAPI → answer with Claude.
+The whole RAG plumbing (loaders, splitter, embed, store, query engine) is **LlamaIndex**;
+we own the FastAPI surface, the Streamlit UI, and the Dagster orchestration.
 
 ## Stack
 
+- **Framework**: LlamaIndex (IngestionPipeline + VectorStoreIndex + RetrieverQueryEngine)
 - **Vector DB**: Qdrant (Docker)
-- **Embeddings**: Voyage AI (`voyage-3`, 1024-dim)
-- **Generation**: Anthropic Claude (Sonnet 4.6)
+- **Embeddings**: Voyage AI (`voyage-3`, 1024-dim) via `llama-index-embeddings-voyageai`
+- **Generation**: Anthropic Claude (Sonnet 4.6) via `llama-index-llms-anthropic`
 - **API**: FastAPI
 - **UI**: Streamlit
 - **Orchestration** (optional): Dagster, ingesting PDFs from Azure Blob Storage
@@ -22,14 +25,12 @@ rag-qdrant/
 ├── src/
 │   ├── config.py                  # pydantic-settings
 │   ├── ingest/
-│   │   ├── loaders.py             # PDF -> page records
-│   │   ├── chunker.py             # recursive char splitter
-│   │   └── pipeline.py            # load -> chunk -> embed -> upsert
+│   │   └── pipeline.py            # LlamaIndex IngestionPipeline (load -> split -> embed -> upsert)
 │   ├── retrieval/
-│   │   ├── embeddings.py          # Voyage wrapper
-│   │   └── store.py               # Qdrant wrapper
+│   │   ├── embeddings.py          # VoyageEmbedding factory
+│   │   └── store.py               # QdrantVectorStore + collection admin (count/reset/list_sources)
 │   ├── generation/
-│   │   └── llm.py                 # Claude wrapper
+│   │   └── llm.py                 # Anthropic LLM + retriever + [#1]-style citation prompt
 │   └── api/main.py                # FastAPI app
 ├── rag_pipelines/                 # Dagster orchestration (optional)
 │   ├── definitions.py             # Definitions entrypoint
@@ -74,19 +75,19 @@ cp .env.example .env
 
 ## The learning path (recommended order)
 
-These standalone scripts walk through each layer in isolation. Run them in order:
+These standalone scripts walk through each LlamaIndex layer in isolation. Run them in order:
 
 ```bash
-# Layer 1: Qdrant mechanics (no embeddings, fake vectors)
+# Layer 1: QdrantVectorStore + VectorStoreIndex (front door vs service entrance)
 uv run python -m scripts.learn.qdrant_walkthrough
 
-# Layer 2: Real Voyage embeddings, semantic search
+# Layer 2: VoyageEmbedding through LlamaIndex (doc/query asymmetry, batched embed)
 uv run python -m scripts.learn.voyage_walkthrough
 
-# Layer 3: Chunking strategies compared
+# Layer 3: Node parsers compared (TokenTextSplitter / SentenceSplitter / SemanticSplitter)
 uv run python -m scripts.learn.chunking_walkthrough
 
-# Layer 4: Claude generation, closing the RAG loop
+# Layer 4: RetrieverQueryEngine — naked vs grounded, streaming, citations
 uv run python -m scripts.learn.generation_walkthrough
 ```
 

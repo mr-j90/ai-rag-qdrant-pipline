@@ -1,4 +1,8 @@
-"""Dagster assets: each PDF blob becomes a partition of `ingested_pdf`."""
+"""Dagster assets: each PDF blob becomes a partition of `ingested_pdf`.
+
+Per-partition execution path:
+    blob → tempdir → src.ingest.pipeline.ingest_path → LlamaIndex IngestionPipeline → Qdrant
+"""
 import tempfile
 from pathlib import Path
 
