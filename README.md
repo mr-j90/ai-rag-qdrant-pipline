@@ -169,11 +169,3 @@ make test        Run pytest
 make lint        Lint with ruff
 make down        Stop Qdrant
 ```
-
-## Where to go next
-
-- **Phase 2**: streaming responses (`/query/stream` with SSE), streaming UI
-- **Phase 3**: hybrid search (sparse + dense via Qdrant's BM25 support)
-- **Phase 4**: reranking with `voyage-rerank-2`
-- **Phase 5**: eval harness — measure retrieval & answer quality
-- **Phase 6**: containerize the whole thing (API + UI + Qdrant in compose)
